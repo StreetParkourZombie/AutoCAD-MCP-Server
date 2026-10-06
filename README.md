@@ -9,11 +9,13 @@ Two backends, one API:
 | **File IPC** | Windows Python | Yes — AutoCAD LT 2024+ (Windows) | Win32 PrintWindow |
 | **ezdxf** | Any platform | No (headless) | matplotlib render |
 
-The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
+The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, Antigravity, etc.) connects and drives AutoCAD through natural-language requests.
+
+> **Docs:** [INDEX.MD](docs/INDEX.MD) · [Met_Errors.md](docs/Met_Errors.md) (integration errors & fixes) · [System_Context.md](docs/System_Context.md) (runtime environment)
 
 ## Prerequisites (File IPC backend)
 
-- **Windows 10/11** (the File IPC backend uses Win32 APIs for focus-free window messaging)
+- **Windows 10/11** (the File IPC backend uses Win32 APIs: desktop switching, focus click, `SendInput`)
 - **AutoCAD LT 2024 or newer** — AutoLISP support was added in LT 2024 for Windows. AutoCAD LT for Mac exists but does **not** support AutoLISP.
 - **Python 3.10+** (Windows native — not WSL Python)
 - **uv** package manager ([install guide](https://docs.astral.sh/uv/getting-started/installation/))
@@ -40,6 +42,8 @@ Open AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 4. You should see: `=== MCP Dispatch v3.1 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
+>
+> **Secure Load:** If AutoCAD prints `File load canceled`, the lisp directory is not trusted yet. The backend auto-trusts and auto-loads on first `initialize()` (appends to `TRUSTEDPATHS`, then `(load ...)`). Or add the folder permanently: AutoCAD Options → Security → Trusted Paths. See [docs/Met_Errors.md](docs/Met_Errors.md) §2.
 
 ### 3. Configure your MCP client
 
@@ -88,6 +92,21 @@ system(operation="status")
 ```
 
 You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"` for headless mode.
+
+#### CLI bypass (no MCP client needed)
+
+Call the server directly over stdio — for scripts, pipelines, or when an MCP client's bridge misbehaves:
+
+```powershell
+# list tools
+.venv\Scripts\python.exe <path>\mcp_cli.py --list
+# drawing info
+.venv\Scripts\python.exe <path>\mcp_cli.py drawing info
+# with data payload
+.venv\Scripts\python.exe <path>\mcp_cli.py layer create --data '{"name":"WALLS","color":"1"}'
+```
+
+Exit code `0` = ok, `1` = tool error, `2` = bad usage.
 
 ## Tools
 
@@ -171,7 +190,9 @@ Python MCP Server (autocad_mcp)
     └── ezdxf Backend ──► in-memory DXF (headless, no AutoCAD needed)
 ```
 
-The File IPC backend sends keystrokes to AutoCAD's MDIClient window via `PostMessageW(WM_CHAR)`, triggering the `(c:mcp-dispatch)` AutoLISP command. This approach does **not** steal window focus — you can continue working in other applications while automation runs.
+**Input chain (AutoCAD 2026 full / WPF CLI):** posted `WM_CHAR` is ignored by the WPF command line, so the backend switches to `WinSta0\Default`, raises the main window above overlapping helper windows (e.g. Help), clicks the **CLI Palette** input row to move focus, then injects real keystrokes via `SendInput`, triggering `(c:mcp-dispatch)` in AutoLISP. Focus returns to your app automatically (no permanent focus steal). On AutoCAD LT the CLI is a classic `MDIClient` edit — the same code path works.
+
+All desktop-sensitive calls (`EnumWindows`, `IsWindow`, `SetCursorPos`, `SendInput`) run while the thread is on the Default desktop; MCP servers launched by Antigravity otherwise run on a private `agy-*` desktop where foreign windows are invisible. See [docs/System_Context.md](docs/System_Context.md).
 
 ## Environment Variables
 
@@ -183,6 +204,19 @@ The File IPC backend sends keystrokes to AutoCAD's MDIClient window via `PostMes
 | `AUTOCAD_MCP_ONLY_TEXT` | `false` | Disable screenshot capture (text feedback only) |
 
 > **Note:** If you change `AUTOCAD_MCP_IPC_DIR`, you must also update the `*mcp-ipc-dir*` variable in `mcp_dispatch.lsp` to match.
+
+## Troubleshooting
+
+| Symptom | Likely cause | See |
+|---------|--------------|-----|
+| `File load canceled` on `(load ...)` | Secure Load — path not in `TRUSTEDPATHS` | [Met_Errors §2](docs/Met_Errors.md) |
+| Typed commands do nothing | WPF CLI ignores posted messages; wrong hwnd | [Met_Errors §3](docs/Met_Errors.md) |
+| Clicks hit the wrong window | Help window overlaying the CLI Palette | [Met_Errors §4](docs/Met_Errors.md) |
+| `window not found` / `Invalid window handle` | Stale handle or cross-desktop `IsWindow` | [Met_Errors §5](docs/Met_Errors.md) |
+| IPC timeout although cmd file was consumed | Unparseable result (Vietnamese `\U+XXXX` escapes) | [Met_Errors §6](docs/Met_Errors.md) |
+| MCP client: `Invalid request parameters` | Client bridge sends `arguments` as string (not this server) | [Met_Errors §7](docs/Met_Errors.md) |
+
+Ground truth for "did AutoCAD get it?": press **F2** and read the Text Window (command echo + LISP errors).
 
 ## Development
 

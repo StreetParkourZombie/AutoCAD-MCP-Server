@@ -1,3 +1,6 @@
+# Hidden
+/docs
+
 # Python
 __pycache__/
 *.py[cod]

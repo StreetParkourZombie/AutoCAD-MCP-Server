@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -30,25 +31,155 @@ POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
 
+# Characters that may legally follow a backslash inside a JSON string.
+_JSON_VALID_ESCAPES = frozenset('"\\/bfnrtu')
+
+
+def _sanitize_json(text: str) -> str:
+    r"""Escape backslashes that JSON would reject.
+
+    AutoCAD LISP payloads may contain layer names with literal text like
+    ``\U+0111`` (how AutoCAD stores characters the ANSI codepage cannot
+    represent). mcp_dispatch.lsp concatenates names raw, so json.loads
+    fails on ``\U`` — which previously surfaced as a bogus IPC timeout.
+
+    Scans escape pairs left-to-right (``\\`` is a valid escaped
+    backslash and is kept), escaping only lone backslashes followed by
+    a character JSON does not accept.
+    """
+
+    def fix(m: re.Match[str]) -> str:
+        esc = m.group(0)
+        return esc if m.group(1) in _JSON_VALID_ESCAPES else "\\" + esc
+
+    # AutoCAD encodes characters outside the ANSI codepage as \U+XXXX
+    # inside layer names — decode them to real Unicode first (Vietnamese).
+    text = re.sub(
+        r"\\U\+([0-9A-Fa-f]{4})",
+        lambda m: chr(int(m.group(1), 16)),
+        text,
+    )
+    return re.sub(r"\\(.)", fix, text, flags=re.S)
+
+
+def _enum_on_default_desktop(predicate) -> list[tuple[int, str]]:
+    r"""Run EnumWindows + predicate on the WinSta0\Default desktop.
+
+    Returns [(hwnd, title), ...] — titles are captured while on Default
+    because after switching back to Antigravity's private desktop
+    (agy-*), GetWindowText on foreign hwnds yields empty strings.
+
+    Returns [] if the desktop switch is not possible; caller then
+    falls back to enumerating on the current desktop.
+    """
+    import ctypes
+
+    import win32gui
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    def obj_name(handle) -> bytes:
+        buf = ctypes.create_string_buffer(256)
+        user32.GetUserObjectInformationA(handle, 2, buf, 256, None)  # UOI_NAME
+        return buf.value
+
+    def grab() -> list[tuple[int, str]]:
+        """Enumerate + filter while on Default desktop."""
+        hits: list[tuple[int, str]] = []
+
+        def cb(hwnd, _acc):
+            try:
+                if predicate(hwnd):
+                    hits.append((hwnd, win32gui.GetWindowText(hwnd)))
+            except Exception:
+                pass
+            return True
+
+        win32gui.EnumWindows(cb, None)
+        return hits
+
+    hdef = 0
+    hprev = 0
+    switched = False
+    try:
+        hdef = user32.OpenDesktopW("Default", 0, False, 0x1FF)  # DESKTOP_ALL
+        if not hdef:
+            return []
+        tid = kernel32.GetCurrentThreadId()
+        hprev = user32.GetThreadDesktop(tid)
+        if obj_name(hdef) != obj_name(hprev):
+            if not user32.SetThreadDesktop(hdef):
+                return []
+            switched = True
+        return grab()
+    except Exception:
+        return []
+    finally:
+        if switched and hprev:
+            user32.SetThreadDesktop(hprev)
+        if hdef:
+            user32.CloseDesktop(hdef)
+
+
+def _is_window(hwnd: int) -> bool:
+    """True if hwnd is still a valid window (guards stale handles)."""
+    if not hwnd:
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.IsWindow(hwnd))
+    except Exception:
+        return False
+
 
 def find_autocad_window() -> int | None:
-    """Find the AutoCAD LT window handle by checking window titles."""
+    r"""Find the AutoCAD window handle (main window or Text Window).
+
+    Runs the enumeration on WinSta0\Default because Antigravity launches
+    the MCP server on its own private desktop (agy-*), where EnumWindows
+    sees no foreign windows and GetWindowText yields empty titles.
+    """
     if sys.platform != "win32":
         return None
     try:
         import win32gui
 
-        windows: list[int] = []
+        def match(hwnd: int) -> bool:
+            # NOTE: runs while on WinSta0\Default — IsWindow/IsWindowVisible
+            # must be called here; from our private desktop they return False.
+            if not _is_window(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return False
+            text = win32gui.GetWindowText(hwnd).lower()
+            # Skip auxiliary windows (Help/Text Window) — they close
+            # independently and leave us with a stale handle.
+            if "help" in text or "text window" in text:
+                return False
+            if text.startswith("autocad"):
+                return True
+            # Fallback: original heuristic (contains "autocad" + drawing name)
+            return "autocad" in text and ("drawing" in text or ".dwg" in text)
 
-        def callback(hwnd, result):
-            if win32gui.IsWindowVisible(hwnd):
-                text = win32gui.GetWindowText(hwnd).lower()
-                if "autocad" in text and ("drawing" in text or ".dwg" in text):
-                    result.append(hwnd)
-            return True
+        matched = _enum_on_default_desktop(match)
+        if matched:
+            # Prefer the drawing document window over anything else
+            for h, title in matched:
+                if ".dwg" in title.lower():
+                    return h
+            return matched[0][0]
 
-        win32gui.EnumWindows(callback, windows)
-        return windows[0] if windows else None
+        # Fallback: enumerate on current desktop (same-desktop case).
+        # On a foreign desktop this raises (error 18) — ignore.
+        try:
+            fallback: list[int] = []
+            win32gui.EnumWindows(lambda hwnd, acc: acc.append(hwnd) or True, fallback)
+            hits = [h for h in fallback if match(h)]
+            if hits:
+                return hits[0]
+        except Exception:
+            pass
+        return None
     except ImportError:
         return None
 
@@ -106,10 +237,23 @@ class FileIPCBackend(AutoCADBackend):
         # Clean up stale IPC files
         self._cleanup_stale_files()
 
-        # Ping the dispatcher to verify it's loaded
+        # Ping the dispatcher; if not loaded, trust the lisp dir then auto-load
+        lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
+        trusted_dir = str(LISP_DIR).replace("\\", "/")
         result = await self._dispatch("ping", {})
         if not result.ok:
-            lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
+            log.info("dispatcher_missing_trying_autoload", lisp=lisp_path)
+            # Secure Load cancels the file otherwise ("File load canceled").
+            # Append the lisp dir to TRUSTEDPATHS without dropping existing entries.
+            self._type_text(
+                '(setvar "TRUSTEDPATHS" (strcat (getvar "TRUSTEDPATHS")'
+                f' (if (= (getvar "TRUSTEDPATHS") "") "" ";") "{trusted_dir}"))'
+            )
+            await asyncio.sleep(0.5)
+            self._type_text(f'(load "{lisp_path}")')
+            await asyncio.sleep(2.0)  # give AutoCAD time to load
+            result = await self._dispatch("ping", {})
+        if not result.ok:
             return CommandResult(
                 ok=False,
                 error=(
@@ -162,6 +306,7 @@ class FileIPCBackend(AutoCADBackend):
 
             # Poll for result
             deadline = time.time() + TIMEOUT
+            parse_failures = 0
             while time.time() < deadline:
                 if result_file.exists():
                     try:
@@ -171,7 +316,7 @@ class FileIPCBackend(AutoCADBackend):
                             text = result_file.read_text(encoding="utf-8")
                         except UnicodeDecodeError:
                             text = result_file.read_text(encoding="cp1252")
-                        data = json.loads(text)
+                        data = json.loads(_sanitize_json(text))
                         # Verify request_id matches
                         if data.get("request_id") == request_id:
                             return CommandResult(
@@ -179,7 +324,20 @@ class FileIPCBackend(AutoCADBackend):
                                 payload=data.get("payload"),
                                 error=data.get("error"),
                             )
-                    except (json.JSONDecodeError, OSError):
+                    except json.JSONDecodeError:
+                        # Result file is written atomically (tmp + rename),
+                        # so a parse failure never heals — fail fast instead
+                        # of reporting a bogus timeout.
+                        parse_failures += 1
+                        if parse_failures >= 5:
+                            return CommandResult(
+                                ok=False,
+                                error=(
+                                    f"Unparseable result (request_id={request_id}): "
+                                    f"{text[:300]!r}"
+                                ),
+                            )
+                    except OSError:
                         pass  # File may be partially written, retry
                 await asyncio.sleep(POLL_INTERVAL)
 
@@ -194,54 +352,226 @@ class FileIPCBackend(AutoCADBackend):
                     pass
 
     def _find_command_line_hwnd(self) -> int | None:
-        """Find AutoCAD's MDIClient child window for command routing."""
+        r"""Find AutoCAD's command-line input window.
+
+        AutoCAD 2026 (full, not LT) hosts the command line in a WPF
+        'CLI Palette' palette bar — its input surface is an HwndWrapper
+        child. MDIClient (LT) only receives WM_CHAR; WPF ignores posted
+        messages, so we must target this window and focus it with a click.
+        """
         if sys.platform != "win32" or not self._hwnd:
             return None
         try:
+            import ctypes
+
             import win32gui
 
-            mdi_client: list[int] = []
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
 
-            def cb(child_hwnd, _):
-                if win32gui.GetClassName(child_hwnd) == "MDIClient":
-                    mdi_client.append(child_hwnd)
-                    return False  # stop enumeration
+            found: list[int] = []
+            cli_bar: list[int] = []
+
+            def pick_wrapper(child_hwnd, _):
+                try:
+                    if win32gui.GetClassName(child_hwnd).startswith("HwndWrapper"):
+                        found.append(child_hwnd)
+                        return False
+                except Exception:
+                    pass
                 return True
 
-            win32gui.EnumChildWindows(self._hwnd, cb, None)
-            return mdi_client[0] if mdi_client else None
+            def pick_bar(child_hwnd, _):
+                try:
+                    if win32gui.GetWindowText(child_hwnd) == "CLI Palette":
+                        cli_bar.append(child_hwnd)
+                        return False
+                except Exception:
+                    pass
+                return True
+
+            # Enumeration must run on the Default desktop
+            # (foreign-desktop threads cannot see these children).
+            tid = kernel32.GetCurrentThreadId()
+            hprev = user32.GetThreadDesktop(tid)
+            hdef = user32.OpenDesktopW("Default", 0, False, 0x1FF)
+            switched = False
+            try:
+                if hdef and hdef != hprev:
+                    switched = bool(user32.SetThreadDesktop(hdef))
+                win32gui.EnumChildWindows(self._hwnd, pick_bar, None)
+                if cli_bar:
+                    win32gui.EnumChildWindows(cli_bar[0], pick_wrapper, None)
+                if not found:
+                    # AutoCAD LT fallback: MDIClient receives WM_CHAR fine
+                    def pick_mdi(child_hwnd, _):
+                        if win32gui.GetClassName(child_hwnd) == "MDIClient":
+                            found.append(child_hwnd)
+                            return False
+                        return True
+
+                    win32gui.EnumChildWindows(self._hwnd, pick_mdi, None)
+            finally:
+                if switched:
+                    user32.SetThreadDesktop(hprev)
+                if hdef:
+                    user32.CloseDesktop(hdef)
+            return found[0] if found else None
         except Exception:
             return None
 
-    def _type_dispatch_trigger(self):
-        """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
+    def _type_text(self, text: str, execute: bool = True):
+        r"""Type text (+ Enter) into AutoCAD's command line via real SendInput.
 
-        Sends ESC keystrokes first to cancel any stale pending command
-        (e.g. from a previous timeout leaving AutoCAD in a command prompt).
+        Posted WM_CHAR never reaches the WPF command line (AutoCAD 2026),
+        so we click the CLI Palette to move focus there and inject real
+        keystrokes. Runs on WinSta0\Default because Antigravity's thread
+        lives on a private desktop.
         """
         try:
             import ctypes
+            from ctypes import wintypes
 
-            WM_CHAR = 0x0102
-            WM_KEYDOWN = 0x0100
-            WM_KEYUP = 0x0101
-            VK_ESCAPE = 0x1B
-            target = self._command_hwnd or self._hwnd
-            post = ctypes.windll.user32.PostMessageW
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
 
-            # Cancel any pending command (2x ESC for nested commands)
-            for _ in range(2):
-                post(target, WM_KEYDOWN, VK_ESCAPE, 0)
-                post(target, WM_KEYUP, VK_ESCAPE, 0)
-            time.sleep(0.05)
+            KEYEVENTF_KEYUP, KEYEVENTF_UNICODE = 0x0002, 0x0004
+            MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x0002, 0x0004
 
-            for ch in "(c:mcp-dispatch)":
-                post(target, WM_CHAR, ord(ch), 0)
-            # Enter = carriage return
-            post(target, WM_CHAR, 0x0D, 0)
-            time.sleep(0.05)
+            class MOUSEINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("dx", ctypes.c_long), ("dy", ctypes.c_long),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t),
+                ]
+
+            class KEYBDINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t),
+                ]
+
+            class HARDWAREINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                    ("wParamH", wintypes.WORD),
+                ]
+
+            class _U(ctypes.Union):
+                _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT),
+                            ("hi", HARDWAREINPUT)]
+
+            class INPUT(ctypes.Structure):
+                _anonymous_ = ("u",)
+                _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+            if ctypes.sizeof(INPUT) != 40:
+                raise RuntimeError(f"unexpected INPUT size {ctypes.sizeof(INPUT)}")
+
+            def send_key(vk_or_char, is_char, up=False):
+                i = INPUT(type=1)
+                if is_char:
+                    i.ki.wVk, i.ki.wScan = 0, vk_or_char
+                    i.ki.dwFlags = KEYEVENTF_UNICODE | (KEYEVENTF_KEYUP if up else 0)
+                else:
+                    i.ki.wVk = vk_or_char
+                    i.ki.dwFlags = KEYEVENTF_KEYUP if up else 0
+                user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(INPUT))
+
+            def type_vk(vk):
+                send_key(vk, False)
+                time.sleep(0.01)
+                send_key(vk, False, up=True)
+
+            # --- desktop switch: SetCursorPos/SendInput need Default desktop
+            tid = kernel32.GetCurrentThreadId()
+            hprev = user32.GetThreadDesktop(tid)
+            hdef = user32.OpenDesktopW("Default", 0, False, 0x1FF)
+            switched = False
+            try:
+                if hdef and hdef != hprev:
+                    switched = bool(user32.SetThreadDesktop(hdef))
+
+                # Minimize same-process helper windows (e.g. "AutoCAD ... Help")
+                # that overlay the CLI Palette — clicks must reach main window.
+                try:
+                    import win32gui
+
+                    def _hid_obstruct(ch, _acc):
+                        try:
+                            if win32gui.IsWindowVisible(ch) and ch != self._hwnd:
+                                t = win32gui.GetWindowText(ch).lower()
+                                if "help" in t:
+                                    user32.ShowWindow(ch, 6)  # SW_MINIMIZE
+                        except Exception:
+                            pass
+                        return True
+
+                    win32gui.EnumWindows(_hid_obstruct, None)
+                except Exception:
+                    pass
+
+                # restore + foreground the main window, RAISE z-order so it
+                # sits above any overlapping sibling (no SWP_NOZORDER here).
+                if user32.IsIconic(self._hwnd):
+                    user32.ShowWindow(self._hwnd, 9)  # SW_RESTORE
+                    time.sleep(0.5)
+                user32.SetWindowPos(self._hwnd, -1, 0, 0, 0, 0, 0x0003)  # HWND_TOP, NOMOVE|NOSIZE
+                fg = user32.GetForegroundWindow()
+                if fg and fg != self._hwnd:
+                    try:
+                        import win32process
+
+                        atid, _ = win32process.GetWindowThreadProcessId(fg)
+                        cur = kernel32.GetCurrentThreadId()
+                        user32.AttachThreadInput(cur, atid, True)
+                        user32.SetForegroundWindow(self._hwnd)
+                        user32.AttachThreadInput(cur, atid, False)
+                    except Exception:
+                        user32.SetForegroundWindow(self._hwnd)
+                else:
+                    user32.SetForegroundWindow(self._hwnd)
+                time.sleep(0.25)
+
+                # click the CLI Palette input row to move focus off the canvas
+                target = self._command_hwnd or self._hwnd
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(target, ctypes.byref(rect)):
+                    cx = rect.left + max(10, (rect.right - rect.left) // 4)
+                    cy = rect.bottom - max(6, (rect.bottom - rect.top) // 8)
+                    user32.SetCursorPos(int(cx), int(cy))
+                    time.sleep(0.12)
+                    m = INPUT(type=0)
+                    m.mi.dwFlags = MOUSEEVENTF_LEFTDOWN
+                    user32.SendInput(1, ctypes.byref(m), ctypes.sizeof(INPUT))
+                    time.sleep(0.06)
+                    m.mi.dwFlags = MOUSEEVENTF_LEFTUP
+                    user32.SendInput(1, ctypes.byref(m), ctypes.sizeof(INPUT))
+                    time.sleep(0.25)
+
+                # ESC ESC: cancel any stale pending command
+                type_vk(0x1B)
+                type_vk(0x1B)
+                time.sleep(0.05)
+
+                for ch in text:
+                    send_key(ord(ch), True)
+                    time.sleep(0.006)
+                if execute:
+                    type_vk(0x0D)  # Enter
+                time.sleep(0.1)
+            finally:
+                if switched:
+                    user32.SetThreadDesktop(hprev)
+                if hdef:
+                    user32.CloseDesktop(hdef)
         except Exception as e:
-            log.error("dispatch_trigger_failed", error=str(e))
+            log.error("type_text_failed", text=text[:40], error=str(e))
+
+    def _type_dispatch_trigger(self):
+        r"""Type '(c:mcp-dispatch)' + Enter into the AutoCAD command line."""
+        self._type_text("(c:mcp-dispatch)")
 
     def _cleanup_stale_files(self):
         """Remove stale IPC files from previous sessions."""
