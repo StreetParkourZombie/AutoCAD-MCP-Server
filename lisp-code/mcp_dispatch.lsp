@@ -164,7 +164,15 @@
 )
 
 ;; -----------------------------------------------------------------------
-;; Command dispatcher — WHITELIST ONLY, no eval
+;; ---------------------------------------------------------------------------
+;; Command dispatcher
+;;
+;; Branches are a hard whitelist: one cond clause per command, no eval, so an
+;; unlisted name is rejected rather than interpreted. The one exception is
+;; `acad-command`, a generic passthrough guarded by a denylist — it lets
+;; callers drive the long tail of the ribbon (TRIM, EXTEND, JOIN, BLOCK, ...)
+;; without a clause per command. See mcp_passthrough.lsp.
+;; ---------------------------------------------------------------------------
 ;; -----------------------------------------------------------------------
 
 (defun mcp-dispatch-command (cmd-name params-json / result)
@@ -416,12 +424,106 @@
     ((= cmd-name "pid-list-symbols")
      (mcp-cmd-pid-list-symbols params-json))
 
+    ;; --- Generic AutoCAD command passthrough (see mcp_passthrough.lsp) ---
+    ((= cmd-name "acad-command")
+     (mcp-cmd-acad-command params-json))
+
     ;; --- Unknown ---
     (t (cons nil (strcat "Unknown command: " cmd-name)))
   )
 )
 
 ;; -----------------------------------------------------------------------
+;; ---------------------------------------------------------------------------
+;; Generic command passthrough
+;;
+;; The cond map above wraps ~60 commands with typed parameters. These two
+;; functions remove that ceiling: any AutoCAD command with a command-line
+;; (script) form becomes reachable, which is ~90% of the ribbon (TRIM, EXTEND,
+;; JOIN, BLOCK, SPLINE, MIRROR3D, ARRAY, ...).
+;;
+;; SAFETY: a denylist rather than an allowlist, because an allowlist would
+;; reintroduce the coverage limit this branch exists to remove. It covers:
+;;   * code injection   - SCRIPT / APPLOAD / load / VL-LOAD (arbitrary LISP)
+;;   * process escape   - SHELL / STARTAPP (launch other programs)
+;;   * security changes - SECURITY / SECURELOAD / TRUSTEDPATHS, and R13..R15
+;;                        profile commands that rewrite acad.lsp
+;; Everything else stays reachable, including destructive-but-normal CAD
+;; commands such as ERASE / SAVE / NEW - same as typing them by hand.
+;;
+;; Flat cond clauses rather than nested if/progn, so the paren structure stays
+;; auditable by eye.
+;;
+;; Depends on helpers defined above: mcp-json-get-string, mcp-split-string,
+;; mcp-escape-string.
+;; ---------------------------------------------------------------------------
+
+(defun mcp-cmd-basename (name)
+  "Strip the locale prefix AutoCAD accepts in front of a command name.
+
+Callers spell the global form \"_.TRIM\" - the underscore forces the English name
+regardless of UI language, the dot runs the global variant - and \"-TRIM\" for
+the English-only form. Any leading dot, underscore or dash is removed so all
+three spellings collapse to the bare name. Returns nil only when name is nil.
+
+Written with substr rather than vl-string-translate: translate with an empty
+replacement string deletes nothing, so \"_.SHELL\" would survive unchanged and
+never match the denylist."
+  (if (not name)
+    nil
+    (progn
+      ;; (substr "" 1 1) returns \"\", which is not in the list, so the loop
+      ;; terminates once the name is consumed.
+      (while (member (substr name 1 1) '("." "_" "-"))
+        (setq name (substr name 2))
+      )
+      name)))
+
+(defun mcp-cmd-denied-p (name / base)
+  "T if the command is on the denylist, so _.SHELL, -shell and SHELL all match."
+  (setq base (mcp-cmd-basename name))
+  (if base
+    ;; member compares strings exactly, so both sides must agree on case.
+    ;; strcase upper-cases the input, which means the list below must be
+    ;; upper-case too; there is no vl-string-downcase in AutoLISP.
+    (member (strcase base)
+            '("SCRIPT" "SCRIPTS" "APPLOAD" "LOAD" "VL-LOAD" "VL-LOAD-COM"
+              "SHELL" "STARTAPP" "RUN" "BROWSER"
+              "SECURITY" "SECURELOAD" "TRUSTEDPATHS" "ACAD"
+              "R13" "R14" "R15"))
+    nil))
+
+(defun mcp-cmd-acad-command (params / args-str args)
+  "Run a raw AutoCAD command. params: {args_str: tok1;tok2;...}.
+
+A space inside a token is encoded as ~ by the Python side, so a token can carry
+a value containing spaces (a file path, a text style) without colliding with the
+separator.
+
+AutoLISP command is a special form: vl-catch-all-apply rejects it with
+bad order function, so it must be invoked through apply. That also rules out
+wrapping it in a handler, hence the validation up front."
+  (setq args-str (mcp-json-get-string params "args_str"))
+  (cond
+    ((not args-str)
+     (cons nil "acad-command: args_str is required"))
+
+    (T
+     (setq args
+            (mapcar '(lambda (a) (vl-string-subst " " "~" a))
+                    (mcp-split-string args-str ";")))
+     (cond
+       ((= (car args) "")
+        (cons nil "acad-command: first token must be the command name"))
+
+       ((mcp-cmd-denied-p (car args))
+        (cons nil (strcat "acad-command: refused by policy: " (car args))))
+
+       (T
+        (apply 'command args)
+        (cons T (strcat "{\"command\": \"" (mcp-escape-string (car args)) "\"}")))))))
+
+;; ---------------------------------------------------------------------------
 ;; Command implementations
 ;; -----------------------------------------------------------------------
 
