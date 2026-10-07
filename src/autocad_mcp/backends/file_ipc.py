@@ -638,6 +638,20 @@ class FileIPCBackend(AutoCADBackend):
             "code_file": str(code_file).replace("\\", "/")
         })
 
+    async def acad_command(self, args: list[str]) -> CommandResult:
+        """Run a raw AutoCAD command via the LISP `command` passthrough.
+
+        Args are the tokens AutoLISP's `command` expects. Spaces inside a token
+        are encoded as `~` because the dispatcher splits on `;` and un-escapes
+        `~` back to a space.
+        """
+        if not args:
+            return CommandResult(ok=False, error="args must contain at least one command token")
+        # str() first: a numeric token such as a radius arrives as an int when it
+        # comes through a JSON schema, and int has no .replace.
+        encoded = [str(a).replace(" ", "~") for a in args]
+        return await self._dispatch("acad-command", {"args_str": ";".join(encoded)})
+
     # --- Entity operations ---
 
     async def create_line(self, x1, y1, x2, y2, layer=None) -> CommandResult:

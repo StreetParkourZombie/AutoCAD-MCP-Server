@@ -474,6 +474,8 @@ async def system(
       runtime       — Return process/runtime details for spawn diagnostics.
       init          — Re-initialize the backend.
       execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
+      acad_command  — Run any AutoCAD command that has a command-line form.
+                      data: {args: ["_.TRIM", "_All", "", ""]}
     """
     data = data or {}
 
@@ -514,6 +516,13 @@ async def system(
         if not data.get("code"):
             return _json({"error": "data.code is required"})
         result = await backend.execute_lisp(data["code"])
+        return await add_screenshot_if_available(result, include_screenshot)
+    elif operation == "acad_command":
+        backend = await get_backend()
+        args = data.get("args")
+        if not args or not isinstance(args, list):
+            return _json({"error": "data.args must be a non-empty list of command tokens"})
+        result = await backend.acad_command(args)
         return await add_screenshot_if_available(result, include_screenshot)
     else:
         return _json({"error": f"Unknown system operation: {operation}"})

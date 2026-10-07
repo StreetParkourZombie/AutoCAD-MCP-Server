@@ -100,6 +100,16 @@ class AutoCADBackend(ABC):
     async def execute_lisp(self, code: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def acad_command(self, args: list[str]) -> CommandResult:
+        """Run a raw AutoCAD command by its command-line tokens.
+
+        Opens up every AutoCAD command that has a command-line form, without
+        needing a dedicated wrapper per command. `args` is the token list for
+        AutoLISP's `command`, e.g. ["_.TRIM", "_All", [], ""]. Use the `_.`
+        prefix so the command is locale-independent.
+        """
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     # --- Entity operations ---
 
     async def create_line(self, x1: float, y1: float, x2: float, y2: float, layer: str | None = None) -> CommandResult:
