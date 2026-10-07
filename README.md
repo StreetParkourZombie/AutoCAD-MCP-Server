@@ -1,5 +1,7 @@
 # AutoCAD MCP Server
 
+Maintainer: **Street Parkour Zombie** ([@StreetParkourZombie](https://github.com/StreetParkourZombie))
+
 MCP server for AutoCAD LT automation and headless DXF generation.
 
 Two backends, one API:
@@ -27,8 +29,8 @@ The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `bloc
 ### 1. Clone and install
 
 ```powershell
-git clone https://github.com/puran-water/autocad-mcp.git
-cd autocad-mcp
+git clone https://github.com/StreetParkourZombie/AutoCAD-MCP-Server.git
+cd AutoCAD-MCP-Server
 uv sync
 ```
 
@@ -172,9 +174,47 @@ Screenshots use `PrintWindow` (Win32) for the File IPC backend — works even wh
 
 ### `system` — Server management
 
-`status`, `health`, `get_backend`, `runtime`, `init`, `execute_lisp`
+`status`, `health`, `get_backend`, `runtime`, `init`, `execute_lisp`, `acad_command`
 
 > `execute_lisp` runs arbitrary AutoLISP code (File IPC only). Pass `data: {code: "(+ 1 2)"}`. This turns the server into an extensible automation platform — any valid AutoLISP expression can be executed.
+
+#### `acad_command` — run any AutoCAD command (File IPC only)
+
+The ~60 commands wrapped with typed parameters elsewhere in this API are only the commands that were convenient to expose. `acad_command` removes that ceiling: **any AutoCAD command that has a command-line (script) form** becomes reachable — which is most of the ribbon. TRIM, EXTEND, JOIN, BLOCK, SPLINE, MIRROR3D, ARRAY, OFFSET, and thousands more.
+
+```json
+{
+  "operation": "acad_command",
+  "data": { "args": ["_.TRIM", "", "_F", "", ""] }
+}
+```
+
+**Token format:**
+
+- Tokens are passed to AutoLISP's `command` verbatim, in order. An **empty string is a bare Enter**, which is how a prompt is accepted without input (`""` = accept default, `_F` = pick the `F` option of an English command).
+- Prefix commands with `_` for the English name regardless of UI language — `_.TRIM`, not `_.CẮT`. Add `.` for the global variant (`_.LINE`).
+- A **space inside a token is encoded as `~`** by the Python side and decoded back before dispatch, so a token can carry a value containing spaces (a file path, a text style) without colliding with anything.
+
+**Security policy — a denylist, not an allowlist:**
+
+An allowlist would reintroduce the coverage limit this feature exists to remove, so the gate blocks three specific classes of command and allows everything else:
+
+| Class | Commands refused | Why |
+|-------|------------------|-----|
+| Arbitrary code injection | `SCRIPT`, `APPLOAD`, `LOAD`, `VL-LOAD`, `VL-LOAD-COM` | Would let a caller run any LISP, which is equivalent to bypassing the whole policy |
+| Process escape | `SHELL`, `STARTAPP`, `RUN`, `BROWSER` | Would let a caller launch other programs |
+| Security reconfiguration | `SECURITY`, `SECURELOAD`, `TRUSTEDPATHS`, `ACAD`, `R13`, `R14`, `R15` | Would let a caller disable Secure Load or rewrite the profile |
+
+Everything else stays reachable, **including destructive-but-normal CAD commands** such as `ERASE`, `SAVE`, `NEW`, and `SAVEAS`. Those are no more dangerous than a person typing them by hand, and blocking them would make the tool unusable for real work. Callers are expected to be an automated agent driving a human's own drawing, not an untrusted tenant.
+
+> [!IMPORTANT]
+> `execute_lisp` has **no** such denylist — it runs arbitrary AutoLISP by design. The `acad_command` denylist is a guardrail against accidental or careless calls, not a security boundary. If an untrusted party can reach this MCP server, they can already reach `execute_lisp`.
+
+A refused command returns an error rather than doing nothing:
+
+```text
+acad-command: refused by policy: _.SHELL
+```
 
 ## Architecture
 
@@ -215,6 +255,9 @@ All desktop-sensitive calls (`EnumWindows`, `IsWindow`, `SetCursorPos`, `SendInp
 | `window not found` / `Invalid window handle` | Stale handle or cross-desktop `IsWindow` | [Met_Errors §5](docs/Met_Errors.md) |
 | IPC timeout although cmd file was consumed | Unparseable result (Vietnamese `\U+XXXX` escapes) | [Met_Errors §6](docs/Met_Errors.md) |
 | MCP client: `Invalid request parameters` | Client bridge sends `arguments` as string (not this server) | [Met_Errors §7](docs/Met_Errors.md) |
+| `acad-command: refused by policy: ...` | Command is on the denylist (by design) | [README §acad_command](#acad_command--run-any-autocad-command-file-ipc-only) |
+| A `denylist` check silently allows a blocked command | `vl-string-translate` with `""` deletes nothing — the locale prefix was never stripped | [Met_Errors §8](docs/Met_Errors.md) |
+| `(load ...)` reported success but the change did not take effect | AutoLISP `load` prints errors instead of raising; wrap it in `vl-catch-all-apply` | [Met_Errors §9](docs/Met_Errors.md) |
 
 Ground truth for "did AutoCAD get it?": press **F2** and read the Text Window (command echo + LISP errors).
 
@@ -238,6 +281,11 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 | Selection sets | AutoLISP on Mac |
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
+
+## What's New in v3.2
+
+- **`acad_command` passthrough** — Run *any* AutoCAD command that has a command-line form, not just the ~60 wrapped with typed parameters. This removes the coverage ceiling: TRIM, EXTEND, JOIN, MIRROR3D, ARRAY and the rest of the ribbon become reachable without adding a wrapper per command. Gated by a policy denylist (see [`system.acad_command`](#acad_command--run-any-autocad-command-file-ipc-only)).
+- **Numeric command tokens** — `acad_command` accepts `["_.CIRCLE", "x,y", "1"]`; tokens are coerced to string, so a radius that arrives as a JSON number no longer crashes with `'int' object has no attribute 'replace'`.
 
 ## What's New in v3.1
 

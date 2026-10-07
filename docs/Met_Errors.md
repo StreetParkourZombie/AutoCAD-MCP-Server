@@ -102,7 +102,120 @@ tools: drawing entity layer block annotation pid view system
 drawing/info → isError: False, entity_count 1669
 ```
 
-**Workaround:** [mcp_cli.py](../scratch/mcp_cli.py) (see README → CLI bypass) calls the server directly over stdio, bypassing the bridge.
+**Workaround:** [mcp_cli.py](../tools/mcp_cli.py) (see README → CLI bypass) calls the server directly over stdio, bypassing the bridge.
+
+---
+
+## 8. Denylist silently allows everything (`vl-string-translate` with `""` deletes nothing)
+
+**Symptom:** The `acad_command` policy denylist was implemented, loaded cleanly, and reported `ok: true` — but `_.SHELL`, `-shell` and `_.SCRIPT` all executed. Three separate fixes were tried before the real cause surfaced.
+
+**Cause:** `vl-string-translate` **does not delete characters when the replacement string is empty.** Given `"_.SHELL"` and `"_-"` → `""`, it returns `"_.SHELL"` unchanged. The locale prefix was therefore never stripped, so `(strcase "_.SHELL")` produced `"_.SHELL"`, which never matched the list entry `"SHELL"`.
+
+This is worth stating plainly because the failure is silent and looks like a logic error: the code reads correctly, and the only way to see it is to ask AutoCAD what the function actually returns.
+
+**Diagnosis — one probe per expression, so the error names the real failure:**
+
+```lisp
+(vl-string-translate "._-" "" "_.SHELL")   ;=> "_.SHELL"   ← not "SHELL"
+(mcp-cmd-denied-p "SHELL")                 ;=> (SHELL STARTAPP ...)  ← matching works
+(mcp-cmd-denied-p "_.SHELL")               ;=> nil                     ← stripping does not
+```
+
+The third line is the tell: the bare name matched and the prefixed name did not, which localises the fault to prefix stripping rather than to `member` or the list itself.
+
+**Fix:** an explicit `substr` loop in `mcp-cmd-basename`, which has no such special case:
+
+```lisp
+(defun mcp-cmd-basename (name)
+  (if (not name)
+    nil
+    (progn
+      (while (member (substr name 1 1) '("." "_" "-"))
+        (setq name (substr name 2))
+      )
+      name)))
+```
+
+Two related traps found in the same debugging session:
+
+- **`member` compares strings case-sensitively.** `strcase` upper-cases its input, so the denylist literals had to be written upper-case. A lower-case list would silently never match, for the same reason.
+- **`vl-string-downcase` does not exist in AutoLISP**, which is what made the case bug look unfixable until the list was upper-cased instead.
+
+> [!TIP]
+> When an AutoLISP predicate returns a wrong answer, probe its **inputs** rather than reasoning about the body. `(mcp-cmd-denied-p "SHELL")` returning a match while `(mcp-cmd-denied-p "_.SHELL")` returned nil identified prefix stripping in one step. Every earlier attempt — a paren-balance checker, a control-diff against `git show HEAD`, a multi-branch probe — failed to isolate it.
+
+---
+
+## 9. `(load ...)` reports success even when the file is broken
+
+**Symptom:** After editing `mcp_dispatch.lsp`, a reload call returned `{"ok": true, "payload": ""}` and the new function was absent. AutoCAD had printed a syntax error to the Text Window, but nothing propagated back to the caller.
+
+**Cause:** AutoLISP `load` **prints errors to the command line and returns; it does not raise.** So an MCP `execute_lisp` call wrapping `(load ...)` looks successful no matter how badly the file is broken.
+
+**Fix:** wrap it so the error travels back as a return value:
+
+```lisp
+(setq *r* (vl-catch-all-apply 'load (list "C:/Dev/autocad-mcp/lisp-code/mcp_dispatch.lsp")))
+(if (vl-catch-all-error-p *r*)
+  (princ (strcat "LOADERR: " (vl-catch-all-error-message *r*)))
+  (princ "LOADOK"))
+```
+
+Assert on the **function**, not just on `LOADOK`, so a stale definition left in memory by an earlier successful load is caught too:
+
+```lisp
+(if (vl-catch-all-error-p (vl-catch-all-apply 'mcp-cmd-denied-p (list "zzzz")))
+  (princ "LOADOK_BUT_MISSING")   ; old code still loaded
+  (princ "LOADOK"))
+```
+
+> [!WARNING]
+> `load` **succeeds** if the file parses even when a called function does not exist yet — AutoLISP resolves symbols at call time, not load time. A clean load therefore proves the file is syntactically valid, and nothing more.
+
+---
+
+## 10. `'int' object has no attribute 'replace'` on a numeric command token
+
+**Symptom:** `acad_command` with `["_.CIRCLE", "127749.0919,88293.0194", "1", ""]` failed with `'int' object has no attribute 'replace'`.
+
+**Cause:** a JSON schema coerces `"1"` into a Python `int` before it reaches the backend, and `int` has no `.replace`.
+
+**Fix:** in `file_ipc.py::acad_command`, coerce before transforming:
+
+```python
+# str() first: a numeric token such as a radius arrives as an int when it
+# comes through a JSON schema, and int has no .replace.
+encoded = [str(a).replace(" ", "~") for a in args]
+```
+
+**Note:** the fix requires an MCP server restart to take effect. LISP-side edits only need a `(load ...)`.
+
+---
+
+## 11. `no function definition: VL-SYMBOL-FUNCTION` / `VL-STRING-DOWNCASE`
+
+**Symptom:** probes failed with `no function definition` for two names that look like plausible Visual LISP utilities.
+
+**Cause:** neither exists. AutoLISP's string utilities are `strcase` (upper-cases; there is no lower-case counterpart), `substr`, `strcat`, `vl-string-translate`, `vl-string-search`. Symbol introspection is done by calling through `vl-catch-all-apply` and testing `vl-catch-all-error-p`, not by asking whether a symbol has a definition.
+
+**Fix:** see §8 and §9 — probe with a caught call:
+
+```lisp
+(if (vl-catch-all-error-p (vl-catch-all-apply 'some-fn (list "x")))
+  "does not exist or raised"
+  "ran successfully")
+```
+
+---
+
+## 12. AutoLISP `cond` treats a non-nil value as a function
+
+**Symptom:** a probe reading back a list of results died with `bad function: "SHELL"`.
+
+**Cause:** `(cond (r "DENY") (T "allow"))` looks like "if `r` is true" but a bare symbol in a `cond` clause is a **call**, so `r` was invoked with `"DENY"`.
+
+**Fix:** use `if` when testing a value rather than enumerating cases.
 
 ---
 
@@ -114,3 +227,12 @@ When input/IPC fails:
 3. Check `TRUSTEDPATHS` if load errors (case 2).
 4. Check overlapping windows (Help, palettes) if clicks miss (case 4).
 5. Validate handles while on `WinSta0\Default` (case 5).
+
+When **LISP returns a plausible but wrong value** (no error, no timeout):
+
+6. `load` succeeding proves nothing on its own — it does not raise (case 9). Assert on the function via a caught call.
+7. Probe one expression at a time and **print the return value**. A predicate that looks right can still return `nil` because an earlier step silently no-ops (case 8).
+8. Watch for AutoLISP functions that do not exist: `vl-string-downcase`, `vl-symbol-function` (case 11).
+
+> [!NOTE]
+> Every passthrough bug in §8–§12 returned `ok: true` or a well-formed value. The Text Window was empty. Only a probe that printed what a function **returns** revealed the fault — reading the source repeatedly did not.

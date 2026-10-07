@@ -77,22 +77,69 @@ autocad_mcp_result_{request_id}.json   # LISP → Python  (atomic: .tmp + rename
 | **Secure Load** | `(load ...)` canceled if path not trusted | `setvar "TRUSTEDPATHS"` append before load (done in `initialize()`) |
 | Command whitelist | dispatcher has **no eval** — commands map only | extend `mcp-dispatch-command` in `mcp_dispatch.lsp` |
 | `SECURELOAD` | blocks `execute-lisp` temp loads | dispatcher sets `SECURELOAD 0` around `load`, restores after |
+| **`acad_command` denylist** | passthrough accepts any command *except* three classes | see §6; refused commands return `refused by policy` |
 
-## 6. Verified State (2026-10-06)
+## 6. Passthrough Policy (`system.acad_command`)
+
+The whitelist map covers ~60 commands with typed parameters. The passthrough
+reaches anything with a command-line form, so the gate is a **denylist** — an
+allowlist would reinstate the ceiling the feature removes.
+
+| Class | Refused | Rationale |
+|-------|---------|-----------|
+| Code injection | `SCRIPT` `APPLOAD` `LOAD` `VL-LOAD` `VL-LOAD-COM` | arbitrary LISP == bypassing the policy itself |
+| Process escape | `SHELL` `STARTAPP` `RUN` `BROWSER` | launching other programs |
+| Security reconfiguration | `SECURITY` `SECURELOAD` `TRUSTEDPATHS` `ACAD` `R13` `R14` `R15` | disabling Secure Load, rewriting the profile |
+
+**Normal CAD commands stay reachable**, including destructive ones (`ERASE`,
+`SAVE`, `NEW`, `SAVEAS`). Blocking those would make the tool useless, and they
+are no more dangerous than a user typing them by hand.
+
+> [!CAUTION]
+> `system.execute_lisp` has **no** denylist — it executes arbitrary AutoLISP by
+> design. The denylist is a guardrail against careless calls, not a security
+> boundary. Treat MCP access to this server as equivalent to a shell on the box.
+
+**Two AutoLISP behaviours the policy depends on** (both silent when wrong — see [Met_Errors §8](Met_Errors.md)):
+
+- `mcp-cmd-denied-p` strips the locale prefix with a `substr` loop. `vl-string-translate` with an empty replacement deletes **nothing**, which would leave `_.SHELL` unstripped and unmatched.
+- The denylist literals are **upper-case**, because `member` compares strings exactly and `strcase` upper-cases its input.
+
+Verified refusals:
+
+```text
+_.SHELL   -> acad-command: refused by policy: _.SHELL
+-shell     -> acad-command: refused by policy: -shell
+_.SCRIPT   -> acad-command: refused by policy: _.SCRIPT
+_.REGEN    -> {"command": "_.REGEN"}          (passes)
+_.LINE     -> entity count 33 -> 34          (passes)
+```
+
+## 7. Verified State (2026-10-07, passthrough branch)
 
 ```text
 backend          file_ipc
-main hwnd        329562 (valid on Default)
-CLI hwnd         198528 (HwndWrapper)
+main hwnd        788512 (valid on Default)
+CLI hwnd         198774 (HwndWrapper)
 initialize       True
-ping             pong (~1.0s)
-drawing-info     {"entity_count": 1669, "layers": ["0","Nét đậm","Nét mãnh","Nét khuất", ...]}
-stdio self-test  8/8 tools, drawing/info isError=False
+dispatcher load  LOADOK   (wrapped in vl-catch-all-apply — bare load never raises)
+entity count     34
+denylist         _.SHELL / -shell / _.SCRIPT refused
+passthrough      _.REGEN ok; _.LINE 33 -> 34; cleanup erases by handle
+version          3.2.0
 ```
+
+Entity counts are drawing-specific and were 1669 in an earlier session; treat
+them as environment state, not a regression signal.
+
+**Cleanup discipline:** verification must erase **the entity it created, by
+handle**. An earlier test used `ERASE _ALL` and destroyed the user's drawing;
+`ERASE` is not on the denylist precisely because it is a normal CAD command, so
+nothing stops a careless test from reaching for it.
 
 **Known issue (external):** Antigravity `call_mcp_tool` bridge sends `arguments` as JSON string → `Invalid request parameters` on every server. Workaround: stdio CLI (`mcp_cli.py`). See [Met_Errors.md §7](Met_Errors.md).
 
-## 7. Environment
+## 8. Environment
 
 | Item | Value |
 |------|-------|
