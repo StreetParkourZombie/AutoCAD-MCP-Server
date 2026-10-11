@@ -1,5 +1,7 @@
 # AutoCAD MCP Server
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/streetparkourzombie/autocad-mcp-server)](https://m8ven.ai/mcp/streetparkourzombie/autocad-mcp-server?s=readme)
+
 Maintainer: **Street Parkour Zombie** ([@StreetParkourZombie](https://github.com/StreetParkourZombie))
 
 MCP server for AutoCAD LT automation and headless DXF generation.

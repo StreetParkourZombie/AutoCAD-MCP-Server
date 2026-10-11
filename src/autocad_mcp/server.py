@@ -30,7 +30,13 @@ mcp = FastMCP("autocad-mcp")
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Drawing Operations", "readOnlyHint": False})
+@mcp.tool(annotations={
+    "title": "AutoCAD Drawing Operations",
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+})
 @_safe("drawing")
 async def drawing(
     operation: str,
@@ -85,7 +91,13 @@ async def drawing(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Entity Operations", "readOnlyHint": False})
+@mcp.tool(annotations={
+    "title": "AutoCAD Entity Operations",
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+})
 @_safe("entity")
 async def entity(
     operation: str,
@@ -187,7 +199,13 @@ async def entity(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Layer Operations", "readOnlyHint": False})
+@mcp.tool(annotations={
+    "title": "AutoCAD Layer Operations",
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+})
 @_safe("layer")
 async def layer(
     operation: str,
@@ -236,7 +254,13 @@ async def layer(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Block Operations", "readOnlyHint": False})
+@mcp.tool(annotations={
+    "title": "AutoCAD Block Operations",
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+})
 @_safe("block")
 async def block(
     operation: str,
@@ -285,7 +309,13 @@ async def block(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD Annotation Operations", "readOnlyHint": False})
+@mcp.tool(annotations={
+    "title": "AutoCAD Annotation Operations",
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+})
 @_safe("annotation")
 async def annotation(
     operation: str,
@@ -339,7 +369,13 @@ async def annotation(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "P&ID Operations (CTO Library)", "readOnlyHint": False})
+@mcp.tool(annotations={
+    "title": "P&ID Operations (CTO Library)",
+    "readOnlyHint": False,
+    "destructiveHint": False,
+    "idempotentHint": False,
+    "openWorldHint": True,
+})
 @_safe("pid")
 async def pid(
     operation: str,
@@ -415,7 +451,13 @@ async def pid(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD View Operations", "readOnlyHint": True})
+@mcp.tool(annotations={
+    "title": "AutoCAD View Operations",
+    "readOnlyHint": True,
+    "destructiveHint": False,
+    "idempotentHint": True,
+    "openWorldHint": True,
+})
 @_safe("view")
 async def view(
     operation: str,
@@ -458,7 +500,13 @@ async def view(
 # ==========================================================================
 
 
-@mcp.tool(annotations={"title": "AutoCAD MCP System", "readOnlyHint": True})
+@mcp.tool(annotations={
+    "title": "AutoCAD MCP System",
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
+    "openWorldHint": True,
+})
 @_safe("system")
 async def system(
     operation: str,
