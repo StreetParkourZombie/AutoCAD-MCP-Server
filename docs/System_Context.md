@@ -132,6 +132,33 @@ version          3.2.0
 Entity counts are drawing-specific and were 1669 in an earlier session; treat
 them as environment state, not a regression signal.
 
+## 7b. MCP Tool Annotations (declared 2026-10-11)
+
+All 8 tools declare the four protocol hints. Values match handler behaviour,
+not aspiration — a client that refuses destructive tools must see the truth:
+
+| Tool | readOnly | destructive | idempotent | Why |
+|------|----------|-------------|------------|-----|
+| `view` | ✅ | ❌ | ✅ | zoom/screenshot change no drawing state |
+| `drawing` | ❌ | ✅ | ❌ | `purge`, `undo`/`redo`, overwrites files |
+| `entity` | ❌ | ✅ | ❌ | `erase` deletes |
+| `layer` | ❌ | ❌ | ❌ | creates/updates properties only |
+| `block` | ❌ | ❌ | ❌ | insert/update attributes |
+| `annotation` | ❌ | ❌ | ❌ | text/dimension creation |
+| `pid` | ❌ | ❌ | ❌ | symbol insertion |
+| `system` | ❌ | ✅ | ❌ | `execute_lisp`/`acad_command` reach anything |
+
+`openWorldHint` is `true` on all 8 — every tool talks to a live AutoCAD
+process (external state). Before these were declared, the M8ven scan reported
+"8/8 tools missing one or more hints" and OpenAI's directory rejects such
+tools outright. `TestToolAnnotations` in `tests/test_view_annotation_tools.py`
+asserts all four hints exist on every registered tool, so a 9th tool cannot be
+added without them.
+
+`idempotentHint` is `false` wherever an operation creates (repeating doubles
+the entity count) or mutates undo history; only `view` qualifies as idempotent
+(zooming twice lands on the same viewport).
+
 **Cleanup discipline:** verification must erase **the entity it created, by
 handle**. An earlier test used `ERASE _ALL` and destroyed the user's drawing;
 `ERASE` is not on the denylist precisely because it is a normal CAD command, so
