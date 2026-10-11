@@ -654,29 +654,29 @@ class FileIPCBackend(AutoCADBackend):
 
     # --- Entity operations ---
 
-    async def create_line(self, x1, y1, x2, y2, layer=None) -> CommandResult:
-        return await self._dispatch("create-line", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer})
+    async def create_line(self, x1, y1, x2, y2, layer=None, color=None) -> CommandResult:
+        return await self._dispatch("create-line", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer, "color": color})
 
-    async def create_circle(self, cx, cy, radius, layer=None) -> CommandResult:
-        return await self._dispatch("create-circle", {"cx": cx, "cy": cy, "radius": radius, "layer": layer})
+    async def create_circle(self, cx, cy, radius, layer=None, color=None) -> CommandResult:
+        return await self._dispatch("create-circle", {"cx": cx, "cy": cy, "radius": radius, "layer": layer, "color": color})
 
-    async def create_polyline(self, points, closed=False, layer=None) -> CommandResult:
+    async def create_polyline(self, points, closed=False, layer=None, color=None) -> CommandResult:
         pts_str = ";".join(f"{p[0]},{p[1]}" for p in points)
         return await self._dispatch("create-polyline", {
-            "points_str": pts_str, "closed": "1" if closed else "0", "layer": layer
+            "points_str": pts_str, "closed": "1" if closed else "0", "layer": layer, "color": color
         })
 
-    async def create_rectangle(self, x1, y1, x2, y2, layer=None) -> CommandResult:
-        return await self._dispatch("create-rectangle", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer})
+    async def create_rectangle(self, x1, y1, x2, y2, layer=None, color=None) -> CommandResult:
+        return await self._dispatch("create-rectangle", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer, "color": color})
 
-    async def create_arc(self, cx, cy, radius, start_angle, end_angle, layer=None) -> CommandResult:
-        return await self._dispatch("create-arc", {"cx": cx, "cy": cy, "radius": radius, "start_angle": start_angle, "end_angle": end_angle, "layer": layer})
+    async def create_arc(self, cx, cy, radius, start_angle, end_angle, layer=None, color=None) -> CommandResult:
+        return await self._dispatch("create-arc", {"cx": cx, "cy": cy, "radius": radius, "start_angle": start_angle, "end_angle": end_angle, "layer": layer, "color": color})
 
-    async def create_ellipse(self, cx, cy, major_x, major_y, ratio, layer=None) -> CommandResult:
-        return await self._dispatch("create-ellipse", {"cx": cx, "cy": cy, "major_x": major_x, "major_y": major_y, "ratio": ratio, "layer": layer})
+    async def create_ellipse(self, cx, cy, major_x, major_y, ratio, layer=None, color=None) -> CommandResult:
+        return await self._dispatch("create-ellipse", {"cx": cx, "cy": cy, "major_x": major_x, "major_y": major_y, "ratio": ratio, "layer": layer, "color": color})
 
-    async def create_mtext(self, x, y, width, text, height=2.5, layer=None) -> CommandResult:
-        return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": text, "height": height, "layer": layer})
+    async def create_mtext(self, x, y, width, text, height=2.5, layer=None, color=None) -> CommandResult:
+        return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": text, "height": height, "layer": layer, "color": color})
 
     async def create_hatch(self, entity_id, pattern="ANSI31") -> CommandResult:
         return await self._dispatch("create-hatch", {"entity_id": entity_id, "pattern": pattern})
@@ -692,6 +692,38 @@ class FileIPCBackend(AutoCADBackend):
 
     async def entity_erase(self, entity_id) -> CommandResult:
         return await self._dispatch("entity-erase", {"entity_id": entity_id})
+
+    async def entity_set_color(self, entity_id, color) -> CommandResult:
+        # Color travels as a string: JSON numbers would come back through
+        # mcp-json-get-number as an atof-truncated float.
+        return await self._dispatch("entity-set-color", {"entity_id": entity_id, "color": str(color)})
+
+    async def entity_delete_by(
+        self,
+        layer=None,
+        type=None,
+        color=None,
+        handles=None,
+        last_n=None,
+    ) -> CommandResult:
+        if not any([layer, type, color, handles, last_n]):
+            return CommandResult(ok=False, error="At least one selector required")
+        # Handles are a list; the wire format is semicolon-delimited, same
+        # convention create_polyline uses for points_str.
+        handles_str = ";".join(str(h) for h in handles) if handles else ""
+        last_n_str = str(int(last_n)) if last_n else ""
+        return await self._dispatch("entity-delete-by", {
+            "layer": layer,
+            "type": type,
+            "color": str(color) if color is not None else None,
+            "handles_str": handles_str,
+            "last_n_str": last_n_str,
+        })
+
+    async def entity_delete_all(self, confirm=False) -> CommandResult:
+        if not confirm:
+            return CommandResult(ok=False, error="entity_delete_all requires confirm=True")
+        return await self._dispatch("entity-delete-all", {"confirm": "1"})
 
     async def entity_copy(self, entity_id, dx, dy) -> CommandResult:
         return await self._dispatch("entity-copy", {"entity_id": entity_id, "dx": dx, "dy": dy})
@@ -768,8 +800,8 @@ class FileIPCBackend(AutoCADBackend):
 
     # --- Annotation ---
 
-    async def create_text(self, x, y, text, height=2.5, rotation=0.0, layer=None) -> CommandResult:
-        return await self._dispatch("create-text", {"x": x, "y": y, "text": text, "height": height, "rotation": rotation, "layer": layer})
+    async def create_text(self, x, y, text, height=2.5, rotation=0.0, layer=None, color=None) -> CommandResult:
+        return await self._dispatch("create-text", {"x": x, "y": y, "text": text, "height": height, "rotation": rotation, "layer": layer, "color": color})
 
     async def create_dimension_linear(self, x1, y1, x2, y2, dim_x, dim_y) -> CommandResult:
         return await self._dispatch("create-dimension-linear", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "dim_x": dim_x, "dim_y": dim_y})

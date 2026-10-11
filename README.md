@@ -133,11 +133,76 @@ Exit code `0` = ok, `1` = tool error, `2` = bad usage.
 
 **Create:** `create_line`, `create_circle`, `create_polyline`, `create_rectangle`, `create_arc`, `create_ellipse`, `create_mtext`, `create_hatch`
 
-**Read:** `list`, `count`, `get`
+**Read:** `list`, `count`, `get` — all three report each entity's ACI colour
 
-**Modify:** `copy`, `move`, `rotate`, `scale`, `mirror`, `offset`\*, `array`, `fillet`\*, `chamfer`\*, `erase`
+**Modify:** `copy`, `move`, `rotate`, `scale`, `mirror`, `offset`\*, `array`, `fillet`\*, `chamfer`\*, `erase`, `set_color`
+
+**Batch delete:** `delete_by`, `delete_all`
 
 > \* `offset`, `fillet`, `chamfer` are File IPC only (not supported in ezdxf headless backend).
+
+#### Entity colour
+
+Every create operation takes an optional `color`, and `set_color` changes it on
+an existing entity. Accepts a name, an ACI index, or a by-state keyword:
+
+| Value | ACI |
+|-------|-----|
+| `red`, `yellow`, `green`, `cyan`, `blue`, `magenta`, `white`, `grey`/`gray` | 1–8 |
+| `byblock` | 0 |
+| `bylayer` | 256 |
+| any integer | passed through |
+
+Unrecognised names fall back to 7 (white) rather than raising.
+
+> [!WARNING]
+> Omitting `color` leaves the entity BYLAYER, so it inherits its layer's colour.
+> Setting an explicit colour breaks that inheritance — the entity no longer
+> follows the layer. Pass `bylayer` to restore it.
+
+```jsonc
+// a red line on the WALLS layer
+{ "operation": "create_line", "x1": 0, "y1": 0, "x2": 100, "y2": 0,
+  "layer": "WALLS", "data": { "color": "red" } }
+
+// recolour later
+{ "operation": "set_color", "entity_id": "2F", "data": { "color": "green" } }
+```
+
+#### Batch delete
+
+`delete_by` matches on any combination of selectors — they are ANDed together,
+so passing two narrows the result. **At least one selector is required**; a call
+with none is refused rather than treated as "delete everything".
+
+```jsonc
+// every entity on one layer
+{ "operation": "delete_by", "data": { "layer": "TEMP" } }
+
+// all red text, nothing else
+{ "operation": "delete_by", "data": { "color": "red", "type": "TEXT" } }
+
+// an explicit list
+{ "operation": "delete_by", "data": { "handles": ["2F", "31"] } }
+
+// the two most recent entities
+{ "operation": "delete_by", "data": { "last_n": 2 } }
+```
+
+The response reports `matched` and `deleted` separately, so a partial delete is
+visible rather than swallowed:
+
+```json
+{ "ok": true, "payload": { "matched": 7, "deleted": 7, "handles": ["2F", "31"] } }
+```
+
+`delete_all` wipes the drawing and requires `confirm: true`. It is the only
+irreversible operation in this tool — `drawing` → `undo` is the way back, and
+only while the undo stack holds it.
+
+```jsonc
+{ "operation": "delete_all", "data": { "confirm": true } }
+```
 
 ### `layer` — Layer management
 
@@ -283,6 +348,12 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 | Selection sets | AutoLISP on Mac |
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
+
+## What's New in v3.3
+
+- **Entity colour** - Every `entity` create operation takes an optional `color`, `set_color` recolours an existing entity, and `list` / `get` now report each entity's ACI colour. Accepts names (`red`, `cyan`, ...), ACI indices, and `bylayer` / `byblock`. Setting an explicit colour breaks the entity's inherit-from-layer behaviour; `bylayer` restores it.
+- **Batch delete** - `delete_by` removes every entity matching any combination of `layer`, `type`, `color`, `handles`, or `last_n` (ANDed; at least one required). `delete_all` wipes the drawing behind a `confirm: true` guard. Both report `matched` and `deleted` separately so a partial delete is visible.
+- **Dispatcher syntax tests** - `tests/test_lisp_dispatcher.py` walks the AutoLISP source with a string-aware scanner and asserts parenthesis balance, unique defun names, and that every `cond` branch has a handler. The dispatcher is plain text loaded at runtime, so a paren typo otherwise surfaces as an opaque dispatcher-not-loaded error minutes later.
 
 ## What's New in v3.2
 

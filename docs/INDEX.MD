@@ -8,8 +8,8 @@ AutoCAD MCP Server — documentation map.
 |----------|----------|
 | [INDEX.MD](INDEX.MD) | This file — documentation map |
 | [Met_Errors.md](Met_Errors.md) | Errors encountered during integration and their root causes/fixes |
-| [System_Context.md](System_Context.md) | Runtime context: windows, desktops, IPC protocol state |
-| [../README.md](../README.md) | Installation, configuration, tool reference |
+| [System_Context.md](System_Context.md) | Runtime context: windows, desktops, IPC protocol state, colour/BYLAYER semantics, destructive-operation surface |
+| [../README.md](../README.md) | Installation, configuration, tool reference, entity colour and batch delete usage |
 
 ## Key Topics
 
@@ -31,8 +31,25 @@ See [Met_Errors.md](Met_Errors.md) for full detail:
 5. **MCP client bridge bug** — `call_mcp_tool` sending `arguments` as string instead of record (client-side, not server).
 6. **Silent AutoLISP no-ops** — `vl-string-translate` with `""` deletes nothing; `load` never raises; `member` compares case-sensitively; `vl-string-downcase` / `vl-symbol-function` do not exist. Every one returned a well-formed value instead of an error.
 7. **JSON coercion on passthrough tokens** — a numeric token (`"1"` as radius) arrives as Python `int` through the schema; `int` has no `.replace` (§10).
+8. **`entget` after `entdel` returns nil** — batch delete read each handle *after* erasing the entity, so `handles` came back empty in every successful response (§13).
+9. **Comment-stripping misreads `;` as a comment** — a naive paren counter treated `";"` (the real delimiter passed to `mcp-split-string`) as a comment marker and deleted real closing parentheses, reporting a phantom imbalance of 13 in a file with none (§14).
 
-> **Diagnostic rule:** these do not appear in the AutoCAD Text Window and do not time out. To find them, probe one expression at a time and print what it **returns** — a predicate reading correctly in the source can still return `nil`.
+> **Diagnostic rule:** these do not appear in the AutoCAD Text Window and do not time out. To find them, probe one expression at a time and print what it **returns** — a predicate reading correctly in the source can still return `nil`. The same rule applies to static analysis: a checker that reports a problem is making claims about the code, so verify the checker before rewriting the code.
+
+### Entity Colour & Batch Delete (v3.3)
+
+- **Colour is a per-entity ACI value** (AutoCAD Color Index 0–256), previously only reachable at layer level. Accepted forms: name (`red`, `cyan`, ...), raw index, or `bylayer` / `byblock`. Unknown names degrade to 7 (white) rather than raising.
+- **BYLAYER inheritance is the sharp edge.** Omitting `color` on a create leaves the entity at 256, inheriting its layer's colour. Writing an explicit colour **breaks that link** — `entmod` group 62 overwrites the inherited value. `bylayer` restores it. Documented on the tool docstring and in the README because the failure is invisible until someone recolours a layer.
+- **DXF group 62 is the ACI colour; 420 is true colour.** The colour-by-name path uses 62. `test_lisp_dispatcher.py` asserts both backends map the same names to the same indices, so `red` cannot mean one thing in ezdxf and another in AutoCAD.
+- **Batch delete reports `matched` and `deleted` separately** — a partial delete is visible in the response rather than swallowed. Selectors are ANDed; **an empty selector set is refused**, never treated as "delete everything".
+- **`entity_delete_all` requires `confirm: true`** and is the only irreversible operation in the tool. `drawing` → `undo` is the way back, and only while the undo stack holds it.
+
+### Dispatcher Test Coverage
+
+`mcp_dispatch.lsp` is plain text loaded at runtime — nothing in pytest exercises it, so a paren typo surfaced as an opaque `dispatcher not loaded` error minutes later (§9). `tests/test_lisp_dispatcher.py` now walks the source with a string-aware scanner and asserts paren balance, unique defun names, a handler behind every `cond` branch, and agreement between the LISP colour map and `_color_to_int`.
+
+> [!NOTE]
+> Pytest can prove the dispatcher is **well-formed**. It cannot prove AutoCAD has it **loaded**. After any LISP edit, reload before trusting a failure mode.
 
 ### Runtime Context
 See [System_Context.md](System_Context.md):
@@ -42,3 +59,4 @@ See [System_Context.md](System_Context.md):
 ## Conventions
 - Docs use `snake_case` tool operation names matching the MCP tool schemas.
 - Code paths are Windows-style (`C:\Dev\autocad-mcp\...`); LISP paths use forward slashes.
+- New backend operations land in **five** places or they fail silently on one backend: `base.py` (declaration), `ezdxf_backend.py`, `file_ipc.py` (dispatcher), `mcp_dispatch.lsp` (cond branch + defun), `server.py` (routing). `tests/test_ipc_protocol.py::EXPECTED_COMMANDS` must gain the kebab command name too.

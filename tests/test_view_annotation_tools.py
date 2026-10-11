@@ -72,14 +72,20 @@ class TestAnnotationRouting:
         server_mod = _patch_backend(monkeypatch, backend)
         data = {"x": 10, "y": 20, "text": "HELLO", "height": 5.0, "rotation": 90.0, "layer": "NOTES"}
         await server_mod.annotation(operation="create_text", data=data)
-        backend.create_text.assert_awaited_once_with(10, 20, "HELLO", 5.0, 90.0, "NOTES")
+        backend.create_text.assert_awaited_once_with(10, 20, "HELLO", 5.0, 90.0, "NOTES", None)
 
     @pytest.mark.asyncio
     async def test_create_text_defaults(self, monkeypatch, backend):
         """Height and rotation default when omitted from data."""
         server_mod = _patch_backend(monkeypatch, backend)
         await server_mod.annotation(operation="create_text", data={"x": 0, "y": 0, "text": "X"})
-        backend.create_text.assert_awaited_once_with(0, 0, "X", 2.5, 0.0, None)
+        backend.create_text.assert_awaited_once_with(0, 0, "X", 2.5, 0.0, None, None)
+
+    @pytest.mark.asyncio
+    async def test_create_text_forwards_color(self, monkeypatch, backend):
+        server_mod = _patch_backend(monkeypatch, backend)
+        await server_mod.annotation(operation="create_text", data={"x": 0, "y": 0, "text": "X", "color": "red"})
+        backend.create_text.assert_awaited_once_with(0, 0, "X", 2.5, 0.0, None, "red")
 
     @pytest.mark.asyncio
     async def test_missing_required_field_is_backend_error(self, monkeypatch, backend):

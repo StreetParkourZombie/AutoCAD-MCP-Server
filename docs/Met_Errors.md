@@ -219,6 +219,78 @@ encoded = [str(a).replace(" ", "~") for a in args]
 
 ---
 
+## 13. `entget` after `entdel` returns nil — batch delete reports empty handles
+
+**Symptom:** `entity_delete_by` returned `{"ok": true, "matched": 3, "deleted": 3, "handles": []}`. The entities were genuinely erased; the handle list was simply empty. No error, no timeout, no Text Window output.
+
+**Cause:** the loop read each handle *after* erasing it:
+
+```lisp
+(foreach target targets
+  (if (entdel target)
+    (progn
+      (setq deleted (1+ deleted))
+      (setq handles-out (strcat handles-out "\"" (cdr (assoc 5 (entget target))) "\""))
+    )
+  )
+)
+```
+
+`entdel` invalidates the entity, so the `entget` that follows yields `nil` and `cdr` of that yields `nil`. The JSON stayed well-formed, so nothing downstream could tell the difference between "deleted three entities, here are their handles" and "deleted three entities, handles unknown". This is the §8/§12 family — a plausible-looking value rather than an error.
+
+**Fix:** capture the handle **before** erasing:
+
+```lisp
+(foreach target targets
+  (setq h (cdr (assoc 5 (entget target))))
+  (if (entdel target)
+    (progn
+      (setq deleted (1+ deleted))
+      (setq handles-out (strcat handles-out "\"" h "\""))
+    )
+  )
+)
+```
+
+The same applies anywhere an operation both reads and destroys — capture the identifier first, always.
+
+**Regression guard:** `tests/test_lisp_dispatcher.py::test_handles_captured_before_entdel` asserts the `entget` call appears *before* `entdel` in the source. The ordering is invisible to pytest otherwise, since the LISP is never executed.
+
+---
+
+## 14. A paren checker that treated `;` as a comment invented an imbalance
+
+**Symptom:** a scratch script checking `mcp_dispatch.lsp` reported 13 unbalanced parentheses. The baseline (`git show HEAD:...`) reported 0, and the working file differed by three new defuns. Every new defun balanced on inspection.
+
+**Cause:** the checker stripped comments with `re.sub(r";.*", "", text)` — the naive AutoLISP rule that everything after `;` is a comment. But `";"` is a real string literal in this file: `mcp-split-string` is called with it as a delimiter, and the batch-delete handlers pass `"handles_str"` values delimited by semicolons. The strip deleted everything after the first `";"` on those lines, taking valid closing parentheses with it.
+
+Worse, the "13 unbalanced" was treated as evidence about the *code*. The actual defect was in the checker.
+
+**Fix:** string-aware scan — skip over literals entirely, and treat `;` as a comment only outside a string:
+
+```python
+def _skip_literal(src, i):
+    if src[i] == "\\":          # AutoLISP char literal, e.g. \U+0041
+        return i + 2
+    quote = src[i]
+    i += 1
+    while i < len(src):
+        if src[i] == "\\":
+            i += 2
+            continue
+        if src[i] == quote:
+            return i + 1
+        i += 1
+    return i
+```
+
+A second draft kept an `in_string` flag *and* skipped literals inline. The double handling consumed the closing quote twice and desynchronised the walk, reporting 19 phantom parentheses. One mechanism, done once. That check is now `tests/test_lisp_dispatcher.py` so the class of mistake cannot recur silently.
+
+> [!TIP]
+> When a static check disagrees with code you have read and believe is correct, **suspect the check first**. Reproduce its claim manually on the smallest input that should trip it — here, `(setq s (mcp-split-string handles-str ";"))` — and the false positive is obvious. The generalisation: a finding is evidence, not a verdict. This is §7's diagnostic rule applied to tooling instead of AutoLISP.
+
+---
+
 ## Quick Diagnostic Sequence
 
 When input/IPC fails:
@@ -233,6 +305,20 @@ When **LISP returns a plausible but wrong value** (no error, no timeout):
 6. `load` succeeding proves nothing on its own — it does not raise (case 9). Assert on the function via a caught call.
 7. Probe one expression at a time and **print the return value**. A predicate that looks right can still return `nil` because an earlier step silently no-ops (case 8).
 8. Watch for AutoLISP functions that do not exist: `vl-string-downcase`, `vl-symbol-function` (case 11).
+9. In any read-then-destroy loop, capture the identifier **before** the destructive call (case 13).
+
+When a **static check** reports a defect in code you have read and believe correct:
+
+10. Suspect the checker before rewriting the code. Reproduce its claim on the smallest input that should trip it (case 14).
+11. Check whether the rule the tool applies is actually true for this language and file — here, "everything after `;` is a comment" is false inside a string literal.
+
+When verifying a **destructive operation** against a live drawing:
+
+12. Erase by **handle**, created in the same step. `ERASE _ALL` is not on the denylist — nothing stops a careless test from reaching for it (see [System_Context §7b](System_Context.md)).
+13. Treat an empty selector set as a bug in the *caller*, not a no-op. `delete_by` refuses it; `delete_all` refuses without `confirm: true`.
 
 > [!NOTE]
-> Every passthrough bug in §8–§12 returned `ok: true` or a well-formed value. The Text Window was empty. Only a probe that printed what a function **returns** revealed the fault — reading the source repeatedly did not.
+> Every passthrough bug in §8–§14 returned `ok: true` or a well-formed value. The Text Window was empty. Only a probe that printed what a function **returns** — or a manual reproduction of a checker's claim — revealed the fault. Reading the source repeatedly did not.
+
+> [!CAUTION]
+> v3.3 adds batch delete. Before running any of it against a real drawing: reload `mcp_dispatch.lsp` (§9), then test on a throwaway `TEMP` layer, never on `0`.

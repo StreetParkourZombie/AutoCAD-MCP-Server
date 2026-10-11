@@ -70,6 +70,27 @@ class EzdxfBackend(AutoCADBackend):
         if layer and layer not in self._doc.layers:
             self._doc.layers.add(layer)
 
+    def _attribs(self, layer: str | None, color: str | int | None = None) -> dict[str, Any]:
+        """Build dxfattribs for a create call.
+
+        Color is omitted when None so the entity keeps BYLAYER (256) and
+        still inherits its layer's colour. Passing a name or an ACI index
+        writes an explicit colour, which breaks that inheritance until it
+        is set back to 'bylayer'.
+        """
+        attribs: dict[str, Any] = {"layer": layer or "0"}
+        if color is not None:
+            attribs["color"] = self._color_to_int(color)
+        return attribs
+
+    @staticmethod
+    def _entity_color(e) -> int:
+        """ACI colour of an entity, or 256 (BYLAYER) when unset."""
+        try:
+            return int(e.dxf.get("color", 256))
+        except (TypeError, ValueError, ezdxf.DXFAttributeError):
+            return 256
+
     # --- Drawing management ---
 
     async def drawing_info(self) -> CommandResult:
@@ -137,46 +158,46 @@ class EzdxfBackend(AutoCADBackend):
 
     # --- Entity operations ---
 
-    async def create_line(self, x1, y1, x2, y2, layer=None) -> CommandResult:
+    async def create_line(self, x1, y1, x2, y2, layer=None, color=None) -> CommandResult:
         self._ensure_layer(layer)
-        e = self._msp.add_line((x1, y1), (x2, y2), dxfattribs={"layer": layer or "0"})
+        e = self._msp.add_line((x1, y1), (x2, y2), dxfattribs=self._attribs(layer, color))
         return CommandResult(ok=True, payload={"entity_type": "LINE", "handle": e.dxf.handle})
 
-    async def create_circle(self, cx, cy, radius, layer=None) -> CommandResult:
+    async def create_circle(self, cx, cy, radius, layer=None, color=None) -> CommandResult:
         self._ensure_layer(layer)
-        e = self._msp.add_circle((cx, cy), radius, dxfattribs={"layer": layer or "0"})
+        e = self._msp.add_circle((cx, cy), radius, dxfattribs=self._attribs(layer, color))
         return CommandResult(ok=True, payload={"entity_type": "CIRCLE", "handle": e.dxf.handle})
 
-    async def create_polyline(self, points, closed=False, layer=None) -> CommandResult:
+    async def create_polyline(self, points, closed=False, layer=None, color=None) -> CommandResult:
         self._ensure_layer(layer)
         pts = [(p[0], p[1]) for p in points]
-        e = self._msp.add_lwpolyline(pts, close=closed, dxfattribs={"layer": layer or "0"})
+        e = self._msp.add_lwpolyline(pts, close=closed, dxfattribs=self._attribs(layer, color))
         return CommandResult(ok=True, payload={"entity_type": "LWPOLYLINE", "handle": e.dxf.handle})
 
-    async def create_rectangle(self, x1, y1, x2, y2, layer=None) -> CommandResult:
+    async def create_rectangle(self, x1, y1, x2, y2, layer=None, color=None) -> CommandResult:
         pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
-        return await self.create_polyline(pts, closed=True, layer=layer)
+        return await self.create_polyline(pts, closed=True, layer=layer, color=color)
 
-    async def create_arc(self, cx, cy, radius, start_angle, end_angle, layer=None) -> CommandResult:
+    async def create_arc(self, cx, cy, radius, start_angle, end_angle, layer=None, color=None) -> CommandResult:
         self._ensure_layer(layer)
-        e = self._msp.add_arc((cx, cy), radius, start_angle, end_angle, dxfattribs={"layer": layer or "0"})
+        e = self._msp.add_arc((cx, cy), radius, start_angle, end_angle, dxfattribs=self._attribs(layer, color))
         return CommandResult(ok=True, payload={"entity_type": "ARC", "handle": e.dxf.handle})
 
-    async def create_ellipse(self, cx, cy, major_x, major_y, ratio, layer=None) -> CommandResult:
+    async def create_ellipse(self, cx, cy, major_x, major_y, ratio, layer=None, color=None) -> CommandResult:
         self._ensure_layer(layer)
         e = self._msp.add_ellipse(
             (cx, cy), major_axis=(major_x - cx, major_y - cy, 0), ratio=ratio,
-            dxfattribs={"layer": layer or "0"},
+            dxfattribs=self._attribs(layer, color),
         )
         return CommandResult(ok=True, payload={"entity_type": "ELLIPSE", "handle": e.dxf.handle})
 
-    async def create_mtext(self, x, y, width, text, height=2.5, layer=None) -> CommandResult:
+    async def create_mtext(self, x, y, width, text, height=2.5, layer=None, color=None) -> CommandResult:
         self._ensure_layer(layer)
         e = self._msp.add_mtext(text, dxfattribs={
             "insert": (x, y),
             "char_height": height,
             "width": width,
-            "layer": layer or "0",
+            **self._attribs(layer, color),
         })
         return CommandResult(ok=True, payload={"entity_type": "MTEXT", "handle": e.dxf.handle})
 
@@ -189,6 +210,7 @@ class EzdxfBackend(AutoCADBackend):
                 "type": e.dxftype(),
                 "handle": e.dxf.handle,
                 "layer": e.dxf.get("layer", "0"),
+                "color": self._entity_color(e),
             })
         return CommandResult(ok=True, payload={"entities": entities, "count": len(entities)})
 
@@ -204,7 +226,12 @@ class EzdxfBackend(AutoCADBackend):
             e = self._doc.entitydb.get(entity_id)
             if e is None:
                 return CommandResult(ok=False, error=f"Entity {entity_id} not found")
-            info = {"type": e.dxftype(), "handle": e.dxf.handle, "layer": e.dxf.get("layer", "0")}
+            info = {
+                "type": e.dxftype(),
+                "handle": e.dxf.handle,
+                "layer": e.dxf.get("layer", "0"),
+                "color": self._entity_color(e),
+            }
             # Add type-specific info
             if e.dxftype() == "LINE":
                 info["start"] = list(e.dxf.start)[:2]
@@ -228,6 +255,101 @@ class EzdxfBackend(AutoCADBackend):
                     return CommandResult(ok=False, error=f"Entity {entity_id} not found")
             self._msp.delete_entity(e)
             return CommandResult(ok=True, payload={"erased": entity_id})
+        except Exception as ex:
+            return CommandResult(ok=False, error=str(ex))
+
+    async def entity_set_color(self, entity_id, color) -> CommandResult:
+        """Set an entity's ACI colour.
+
+        Accepts a colour name, an ACI index, or 'bylayer' / 'byblock'. Writing
+        an explicit colour breaks the entity's BYLAYER inheritance — pass
+        'bylayer' to hand control back to the layer.
+        """
+        try:
+            e = self._doc.entitydb.get(entity_id)
+            if e is None:
+                if entity_id == "last" and len(self._msp) > 0:
+                    e = list(self._msp)[-1]
+                else:
+                    return CommandResult(ok=False, error=f"Entity {entity_id} not found")
+            e.dxf.color = self._color_to_int(color)
+            return CommandResult(ok=True, payload={"handle": e.dxf.handle, "color": self._entity_color(e)})
+        except Exception as ex:
+            return CommandResult(ok=False, error=str(ex))
+
+    async def entity_delete_by(
+        self,
+        layer=None,
+        type=None,
+        color=None,
+        handles=None,
+        last_n=None,
+    ) -> CommandResult:
+        """Delete every entity matching the given selectors.
+
+        Selectors are ANDed together. At least one is required — an empty
+        call is refused rather than silently treated as 'delete everything'.
+        'matched' and 'deleted' are reported separately so a partial delete
+        is visible in the response.
+        """
+        if not any([layer, type, color, handles, last_n]):
+            return CommandResult(ok=False, error="At least one selector required")
+
+        try:
+            wanted_aci = self._color_to_int(color) if color is not None else None
+            wanted_handles = set(handles) if handles else None
+
+            matches = []
+            for e in self._msp:
+                if layer and e.dxf.get("layer", "0") != layer:
+                    continue
+                if type and e.dxftype() != type:
+                    continue
+                if wanted_aci is not None and self._entity_color(e) != wanted_aci:
+                    continue
+                if wanted_handles is not None and e.dxf.handle not in wanted_handles:
+                    continue
+                matches.append(e)
+
+            if last_n:
+                matches = matches[-int(last_n):]
+
+            deleted = []
+            for e in matches:
+                handle = e.dxf.handle
+                self._msp.delete_entity(e)
+                deleted.append(handle)
+
+            return CommandResult(ok=True, payload={
+                "matched": len(matches),
+                "deleted": len(deleted),
+                "handles": deleted,
+            })
+        except Exception as ex:
+            return CommandResult(ok=False, error=str(ex))
+
+    async def entity_delete_all(self, confirm=False) -> CommandResult:
+        """Delete every entity in the drawing.
+
+        Irreversible via MCP — `drawing` -> `undo` is the only way back, and
+        only if the AutoCAD undo stack still holds it. Pass confirm=True to
+        proceed; the default refusal is the point.
+        """
+        if not confirm:
+            return CommandResult(ok=False, error="entity_delete_all requires confirm=True")
+
+        try:
+            matches = list(self._msp)
+            deleted = []
+            for e in matches:
+                handle = e.dxf.handle
+                self._msp.delete_entity(e)
+                deleted.append(handle)
+            return CommandResult(ok=True, payload={
+                "matched": len(matches),
+                "deleted": len(deleted),
+                "handles": deleted,
+            })
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
 
@@ -509,13 +631,13 @@ class EzdxfBackend(AutoCADBackend):
 
     # --- Annotation ---
 
-    async def create_text(self, x, y, text, height=2.5, rotation=0.0, layer=None) -> CommandResult:
+    async def create_text(self, x, y, text, height=2.5, rotation=0.0, layer=None, color=None) -> CommandResult:
         self._ensure_layer(layer)
         e = self._msp.add_text(text, dxfattribs={
             "insert": (x, y),
             "height": height,
             "rotation": rotation,
-            "layer": layer or "0",
+            **self._attribs(layer, color),
         })
         return CommandResult(ok=True, payload={"entity_type": "TEXT", "handle": e.dxf.handle})
 
@@ -739,9 +861,16 @@ class EzdxfBackend(AutoCADBackend):
 
     @staticmethod
     def _color_to_int(color: str | int) -> int:
+        """Map a colour name or index to its AutoCAD Color Index.
+
+        Unknown names fall back to 7 (white) — the same default
+        layer_create has always used. BYLAYER (256) and BYBLOCK (0) are
+        real DXF values, not names, so they need explicit handling.
+        """
         if isinstance(color, int):
             return color
         color_map = {
+            "bylayer": 256, "byblock": 0,
             "red": 1, "yellow": 2, "green": 3, "cyan": 4,
             "blue": 5, "magenta": 6, "white": 7, "grey": 8, "gray": 8,
         }

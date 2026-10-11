@@ -112,25 +112,25 @@ class AutoCADBackend(ABC):
 
     # --- Entity operations ---
 
-    async def create_line(self, x1: float, y1: float, x2: float, y2: float, layer: str | None = None) -> CommandResult:
+    async def create_line(self, x1: float, y1: float, x2: float, y2: float, layer: str | None = None, color: str | int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def create_circle(self, cx: float, cy: float, radius: float, layer: str | None = None) -> CommandResult:
+    async def create_circle(self, cx: float, cy: float, radius: float, layer: str | None = None, color: str | int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def create_polyline(self, points: list[list[float]], closed: bool = False, layer: str | None = None) -> CommandResult:
+    async def create_polyline(self, points: list[list[float]], closed: bool = False, layer: str | None = None, color: str | int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def create_rectangle(self, x1: float, y1: float, x2: float, y2: float, layer: str | None = None) -> CommandResult:
+    async def create_rectangle(self, x1: float, y1: float, x2: float, y2: float, layer: str | None = None, color: str | int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def create_arc(self, cx: float, cy: float, radius: float, start_angle: float, end_angle: float, layer: str | None = None) -> CommandResult:
+    async def create_arc(self, cx: float, cy: float, radius: float, start_angle: float, end_angle: float, layer: str | None = None, color: str | int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def create_ellipse(self, cx: float, cy: float, major_x: float, major_y: float, ratio: float, layer: str | None = None) -> CommandResult:
+    async def create_ellipse(self, cx: float, cy: float, major_x: float, major_y: float, ratio: float, layer: str | None = None, color: str | int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def create_mtext(self, x: float, y: float, width: float, text: str, height: float = 2.5, layer: str | None = None) -> CommandResult:
+    async def create_mtext(self, x: float, y: float, width: float, text: str, height: float = 2.5, layer: str | None = None, color: str | int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def create_hatch(self, entity_id: str, pattern: str = "ANSI31") -> CommandResult:
@@ -146,6 +146,34 @@ class AutoCADBackend(ABC):
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def entity_erase(self, entity_id: str) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_set_color(self, entity_id: str, color: str | int) -> CommandResult:
+        """Set an entity's ACI colour.
+
+        Accepts a colour name, an ACI index, or 'bylayer' / 'byblock'.
+        Writing an explicit colour breaks the entity's BYLAYER inheritance —
+        pass 'bylayer' to hand control back to the layer.
+        """
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_delete_by(
+        self,
+        layer: str | None = None,
+        type: str | None = None,
+        color: str | int | None = None,
+        handles: list[str] | None = None,
+        last_n: int | None = None,
+    ) -> CommandResult:
+        """Delete every entity matching the given selectors.
+
+        Selectors are ANDed together and at least one is required — an
+        empty call is refused rather than treated as 'delete everything'.
+        """
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_delete_all(self, confirm: bool = False) -> CommandResult:
+        """Delete every entity. Requires confirm=True."""
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def entity_copy(self, entity_id: str, dx: float, dy: float) -> CommandResult:
@@ -223,7 +251,7 @@ class AutoCADBackend(ABC):
 
     # --- Annotation ---
 
-    async def create_text(self, x: float, y: float, text: str, height: float = 2.5, rotation: float = 0.0, layer: str | None = None) -> CommandResult:
+    async def create_text(self, x: float, y: float, text: str, height: float = 2.5, rotation: float = 0.0, layer: str | None = None, color: str | int | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def create_dimension_linear(self, x1: float, y1: float, x2: float, y2: float, dim_x: float, dim_y: float) -> CommandResult:
