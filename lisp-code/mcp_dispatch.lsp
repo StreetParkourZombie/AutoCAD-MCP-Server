@@ -98,18 +98,23 @@
           (if (null pos) nil
             (progn
               (setq pos (+ pos 2))  ; 0-based search result + 2 = 1-based position after quote
-              ;; Find closing quote (skip escaped quotes)
+              ;; Find the closing quote (skip escaped quotes)
               (setq end-pos pos)
-              (while (and (<= end-pos (strlen json))
-                          (or (= end-pos pos)
-                              (/= (substr json end-pos 1) "\"")))
+              (while (and (< end-pos (strlen json))
+                          (/= (substr json end-pos 1) "\""))
                 ;; Handle escaped characters
                 (if (= (substr json end-pos 1) "\\")
                   (setq end-pos (+ end-pos 2))
                   (setq end-pos (1+ end-pos))
                 )
               )
-              (substr json pos (- end-pos pos))
+              ;; end-pos == pos means the value was empty, e.g. "". Return nil
+              ;; for it so callers' presence checks work — a stray quote
+              ;; character would be truthy and silently defeat them.
+              (if (= end-pos pos)
+                nil
+                (substr json pos (- end-pos pos))
+              )
             )
           )
         )
@@ -160,6 +165,104 @@
     (setq str (substr str (+ pos 2)))
   )
   (setq result (append result (list str)))
+  result
+)
+
+(defun mcp-color-to-aci (color / s)
+  "Map a colour name or index to its AutoCAD Color Index. Unknown names fall back to 7 (white).
+
+  Mirrors EzdxfBackend._color_to_int so both backends agree on what
+  'red' means. Numeric strings pass through as indices."
+  (if (null color)
+    nil
+    (progn
+      (setq s (strcase (vl-princ-to-string color)))
+      (cond
+        ((= s "BYLAYER") 256)
+        ((= s "BYBLOCK") 0)
+        ((= s "RED") 1)
+        ((= s "YELLOW") 2)
+        ((= s "GREEN") 3)
+        ((= s "CYAN") 4)
+        ((= s "BLUE") 5)
+        ((= s "MAGENTA") 6)
+        ((= s "WHITE") 7)
+        ((= s "GREY") 8)
+        ((= s "GRAY") 8)
+        ((= (atoi s) 0) 7)
+        (T (atoi s))
+      )
+    )
+  )
+)
+
+(defun mcp-take-last-n (lst n / count rev kept)
+  "Return the newest n elements of lst, preserving their original order.
+
+  Two AutoLISP differences make the obvious spellings fail:
+    - `last` takes one argument, so the Common Lisp (last lst n) form
+      raises \"too many arguments\".
+    - `nth` returns the element at an index, not the sublist starting
+      there, so it cannot express \"drop the first k\" the way Common
+      Lisp's nthcdr does.
+  Reversing instead puts the newest element first, so trimming to the
+  first n is a simple car/cdr walk, and reversing back restores the
+  original order. Clamps n and returns nil for an empty list."
+  (if (or (null lst) (< n 1))
+    nil
+    (progn
+      (setq count (length lst))
+      (if (> n count) (setq n count))
+      (setq rev (reverse lst))
+      (setq kept '())
+      (while (and rev (< (length kept) n))
+        (setq kept (append kept (list (car rev))))
+        (setq rev (cdr rev))
+      )
+      (reverse kept)
+    )
+  )
+)
+
+(defun mcp-set-color (ent aci)
+  "Write an ACI colour onto a specific entity.
+
+  The list must be appended to the entity's existing DXF data: the bare
+  (entmod (list (cons 62 aci))) form returns without error but leaves
+  group 62 nil, so the colour silently never lands. This one-argument
+  entmod targets entlast, which is why the entity is passed explicitly —
+  recolouring an arbitrary handle must not depend on it being newest."
+  (entmod (append (entget ent) (list (cons 62 aci))))
+)
+
+(defun mcp-apply-color (params / color aci)
+  "Set an explicit colour on the entity just created, if one was requested.
+
+  Skipped when color is absent so the new entity keeps BYLAYER and still
+  inherits its layer's colour."
+  (setq color (mcp-json-get-string params "color"))
+  (if color
+    (progn
+      (setq aci (mcp-color-to-aci color))
+      (mcp-set-color (entlast) aci)
+    )
+  )
+)
+
+(defun mcp-create-with-color (create-fn params / result)
+  "Run a create handler, then apply any requested colour to the new entity.
+
+  Colour has to be applied after the (command ...) call — the entity must
+  exist before entmod can touch it. Wrapping here keeps that ordering in
+  one place instead of in every create defun.
+
+  create-fn arrives as the symbol name, so it must be invoked with apply:
+  AutoLISP has no (create-fn params) form — that is Common Lisp — and
+  calling it that way raises \"bad function: MCP-CMD-CREATE-LINE\"."
+  (setq result (apply create-fn (list params)))
+  (if (mcp-json-get-string params "color")
+    (mcp-apply-color params)
+  )
   result
 )
 
@@ -224,28 +327,28 @@
 
     ;; --- Entity creation ---
     ((= cmd-name "create-line")
-     (mcp-cmd-create-line params-json))
+     (mcp-create-with-color 'mcp-cmd-create-line params-json))
 
     ((= cmd-name "create-circle")
-     (mcp-cmd-create-circle params-json))
+     (mcp-create-with-color 'mcp-cmd-create-circle params-json))
 
     ((= cmd-name "create-polyline")
-     (mcp-cmd-create-polyline params-json))
+     (mcp-create-with-color 'mcp-cmd-create-polyline params-json))
 
     ((= cmd-name "create-rectangle")
-     (mcp-cmd-create-rectangle params-json))
+     (mcp-create-with-color 'mcp-cmd-create-rectangle params-json))
 
     ((= cmd-name "create-text")
-     (mcp-cmd-create-text params-json))
+     (mcp-create-with-color 'mcp-cmd-create-text params-json))
 
     ((= cmd-name "create-arc")
-     (mcp-cmd-create-arc params-json))
+     (mcp-create-with-color 'mcp-cmd-create-arc params-json))
 
     ((= cmd-name "create-ellipse")
-     (mcp-cmd-create-ellipse params-json))
+     (mcp-create-with-color 'mcp-cmd-create-ellipse params-json))
 
     ((= cmd-name "create-mtext")
-     (mcp-cmd-create-mtext params-json))
+     (mcp-create-with-color 'mcp-cmd-create-mtext params-json))
 
     ((= cmd-name "create-hatch")
      (mcp-cmd-create-hatch params-json))
@@ -290,6 +393,15 @@
 
     ((= cmd-name "entity-chamfer")
      (mcp-cmd-entity-chamfer params-json))
+
+    ((= cmd-name "entity-set-color")
+     (mcp-cmd-entity-set-color params-json))
+
+    ((= cmd-name "entity-delete-by")
+     (mcp-cmd-entity-delete-by params-json))
+
+    ((= cmd-name "entity-delete-all")
+     (mcp-cmd-entity-delete-all params-json))
 
     ;; --- View ---
     ((= cmd-name "zoom-extents")
@@ -667,7 +779,7 @@ wrapping it in a handler, hence the validation up front."
   (cons T (strcat "{\"count\":" (itoa count) "}"))
 )
 
-(defun mcp-cmd-entity-list (params / layer entities ent ent-data etype handle elayer)
+(defun mcp-cmd-entity-list (params / layer entities ent ent-data etype handle elayer ecolor)
   (setq layer (mcp-json-get-string params "layer"))
   (setq entities "" ent (entnext))
   (while ent
@@ -675,12 +787,13 @@ wrapping it in a handler, hence the validation up front."
     (setq etype (cdr (assoc 0 ent-data)))
     (setq handle (cdr (assoc 5 ent-data)))
     (setq elayer (cdr (assoc 8 ent-data)))
+    (setq ecolor (if (cdr (assoc 62 ent-data)) (cdr (assoc 62 ent-data)) 256))
     (if (or (not layer) (= elayer layer))
       (progn
         (if (> (strlen entities) 0)
           (setq entities (strcat entities ","))
         )
-        (setq entities (strcat entities "{\"type\":\"" etype "\",\"handle\":\"" handle "\",\"layer\":\"" elayer "\"}"))
+        (setq entities (strcat entities "{\"type\":\"" etype "\",\"handle\":\"" handle "\",\"layer\":\"" elayer "\",\"color\":" (itoa ecolor) "}"))
       )
     )
     (setq ent (entnext ent))
@@ -943,7 +1056,7 @@ wrapping it in a handler, hence the validation up front."
 
 ;; --- Entity query: get ---
 
-(defun mcp-cmd-entity-get (params / entity-id ent ent-data etype handle elayer result)
+(defun mcp-cmd-entity-get (params / entity-id ent ent-data etype handle elayer ecolor result)
   (setq entity-id (mcp-json-get-string params "entity_id"))
   (if (= entity-id "last")
     (setq ent (entlast))
@@ -956,7 +1069,8 @@ wrapping it in a handler, hence the validation up front."
       (setq etype (cdr (assoc 0 ent-data)))
       (setq handle (cdr (assoc 5 ent-data)))
       (setq elayer (cdr (assoc 8 ent-data)))
-      (setq result (strcat "{\"type\":\"" etype "\",\"handle\":\"" handle "\",\"layer\":\"" elayer "\""))
+      (setq ecolor (if (cdr (assoc 62 ent-data)) (cdr (assoc 62 ent-data)) 256))
+      (setq result (strcat "{\"type\":\"" etype "\",\"handle\":\"" handle "\",\"layer\":\"" elayer "\",\"color\":" (itoa ecolor)))
       ;; Add type-specific info
       (cond
         ((= etype "LINE")
@@ -975,6 +1089,129 @@ wrapping it in a handler, hence the validation up front."
 )
 
 ;; --- Entity modification commands ---
+
+;; --- Entity colour and batch delete ---
+
+(defun mcp-cmd-entity-set-color (params / entity-id color aci ent)
+  (setq entity-id (mcp-json-get-string params "entity_id"))
+  (setq color (mcp-json-get-string params "color"))
+  (if (not color)
+    (cons nil "color required")
+    (progn
+      (setq aci (mcp-color-to-aci color))
+      (if (= entity-id "last")
+        (setq ent (entlast))
+        (setq ent (handent entity-id))
+      )
+      (if (not ent)
+        (cons nil (strcat "Entity not found: " entity-id))
+        (progn
+          (mcp-set-color ent aci)
+          (cons T (strcat "{\"handle\":\"" (cdr (assoc 5 (entget ent))) "\",\"color\":" (itoa aci) "}"))
+        )
+      )
+    )
+  )
+)
+
+(defun mcp-cmd-entity-delete-by
+  (params / layer etype color handles-str last-n-str last-n handles aci
+          ent ent-data ent-layer ent-type ent-color targets
+          matched deleted handles-out target h n)
+  (setq layer (mcp-json-get-string params "layer"))
+  (setq etype (mcp-json-get-string params "type"))
+  (setq color (mcp-json-get-string params "color"))
+  (setq handles-str (mcp-json-get-string params "handles_str"))
+  (setq last-n-str (mcp-json-get-string params "last_n_str"))
+  ;; An empty last_n_str parses to 0, and AutoLISP treats only nil as false,
+  ;; so 0 would pass as a real selector and then mcp-take-last-n would drop
+  ;; every match. Require a positive count.
+  (setq last-n (if (and last-n-str (> (atoi last-n-str) 0)) (atoi last-n-str) nil))
+  ;; Only split a genuinely non-empty handle list. mcp-split-string of ""
+  ;; yields the list (""), which is truthy, and the (member ...) test below
+  ;; would then reject every entity in the drawing.
+  (setq handles
+    (if (and handles-str (> (strlen handles-str) 1))
+      (mcp-split-string handles-str ";")
+      nil
+    )
+  )
+  (setq aci (mcp-color-to-aci color))
+
+  (if (and (not layer) (not etype) (not aci) (not handles) (not last-n))
+    (cons nil "At least one selector required")
+    (progn
+      ;; First pass: collect matches without deleting, so `matched` reflects
+      ;; the blast radius even when a later entdel fails.
+      (setq targets '())
+      (setq ent (entnext))
+      (while ent
+        (setq ent-data (entget ent))
+        (setq ent-layer (cdr (assoc 8 ent-data)))
+        (setq ent-type (cdr (assoc 0 ent-data)))
+        (setq ent-color (if (cdr (assoc 62 ent-data)) (cdr (assoc 62 ent-data)) 256))
+        (if (and (or (not layer) (= ent-layer layer))
+                 (or (not etype) (= ent-type etype))
+                 (or (not aci) (= ent-color aci))
+                 (or (not handles) (member (cdr (assoc 5 ent-data)) handles)))
+          (setq targets (append targets (list ent)))
+        )
+        (setq ent (entnext ent))
+      )
+      ;; Keep only the newest N matches.
+      (if last-n
+        (setq targets (mcp-take-last-n targets last-n))
+      )
+
+      (setq matched (length targets))
+      (setq deleted 0)
+      (setq handles-out "")
+      (foreach target targets
+        (setq h (cdr (assoc 5 (entget target))))
+        (if (entdel target)
+          (progn
+            (setq deleted (1+ deleted))
+            (if (> (strlen handles-out) 0) (setq handles-out (strcat handles-out ",")))
+            (setq handles-out (strcat handles-out "\"" h "\""))
+          )
+        )
+      )
+      (cons T (strcat "{\"matched\":" (itoa matched)
+                      ",\"deleted\":" (itoa deleted)
+                      ",\"handles\":[" handles-out "]}"))
+    )
+  )
+)
+
+(defun mcp-cmd-entity-delete-all (params / ent targets matched deleted handles-out target h)
+  (if (/= (mcp-json-get-string params "confirm") "1")
+    (cons nil "entity-delete-all requires confirm=1")
+    (progn
+      (setq targets '())
+      (setq ent (entnext))
+      (while ent
+        (setq targets (append targets (list ent)))
+        (setq ent (entnext ent))
+      )
+      (setq matched (length targets))
+      (setq deleted 0)
+      (setq handles-out "")
+      (foreach target targets
+        (setq h (cdr (assoc 5 (entget target))))
+        (if (entdel target)
+          (progn
+            (setq deleted (1+ deleted))
+            (if (> (strlen handles-out) 0) (setq handles-out (strcat handles-out ",")))
+            (setq handles-out (strcat handles-out "\"" h "\""))
+          )
+        )
+      )
+      (cons T (strcat "{\"matched\":" (itoa matched)
+                      ",\"deleted\":" (itoa deleted)
+                      ",\"handles\":[" handles-out "]}"))
+    )
+  )
+)
 
 (defun mcp-cmd-entity-copy (params / entity-id dx dy ent new-handle)
   (setq entity-id (mcp-json-get-string params "entity_id"))

@@ -1,4 +1,4 @@
-"""AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
+"""AutoCAD MCP Server v3.3 — 8 consolidated tools with operation dispatch.
 
 Tools: drawing, entity, layer, block, annotation, pid, view, system
 """
@@ -114,19 +114,19 @@ async def entity(
     """Entity creation, querying, and modification.
 
     Create operations:
-      create_line       — x1, y1, x2, y2, layer?
-      create_circle     — data: {cx, cy, radius}, layer?
-      create_polyline   — points: [[x,y],...], data: {closed?}, layer?
-      create_rectangle  — x1, y1, x2, y2, layer?
-      create_arc        — data: {cx, cy, radius, start_angle, end_angle}, layer?
-      create_ellipse    — data: {cx, cy, major_x, major_y, ratio}, layer?
-      create_mtext      — data: {x, y, width, text, height?}, layer?
+      create_line       — x1, y1, x2, y2, layer?, color?
+      create_circle     — data: {cx, cy, radius}, layer?, color?
+      create_polyline   — points: [[x,y],...], data: {closed?}, layer?, color?
+      create_rectangle  — x1, y1, x2, y2, layer?, color?
+      create_arc        — data: {cx, cy, radius, start_angle, end_angle}, layer?, color?
+      create_ellipse    — data: {cx, cy, major_x, major_y, ratio}, layer?, color?
+      create_mtext      — data: {x, y, width, text, height?}, layer?, color?
       create_hatch      — entity_id, data: {pattern?}
 
     Read operations:
-      list              — layer? → list entities
+      list              — layer? → list entities (includes colour)
       count             — layer? → count entities
-      get               — entity_id → entity details
+      get               — entity_id → entity details (includes colour)
 
     Modify operations:
       copy    — entity_id, data: {dx, dy}
@@ -139,25 +139,33 @@ async def entity(
       fillet  — data: {id1, id2, radius}
       chamfer — data: {id1, id2, dist1, dist2}
       erase   — entity_id
+      set_color — entity_id, data: {color}. Colour name, ACI index, or
+                   'bylayer'. An explicit colour stops the entity inheriting
+                   its layer's colour; 'bylayer' restores inheritance.
+
+    Batch delete (selectors are ANDed; at least one is required):
+      delete_by  — data: {layer?, type?, color?, handles?, last_n?}
+      delete_all — data: {confirm: true}. Wipes every entity. Irreversible
+                   except via `drawing` → `undo`.
     """
     data = data or {}
     backend = await get_backend()
 
     # --- Create ---
     if operation == "create_line":
-        result = await backend.create_line(x1, y1, x2, y2, layer)
+        result = await backend.create_line(x1, y1, x2, y2, layer, data.get("color"))
     elif operation == "create_circle":
-        result = await backend.create_circle(data["cx"], data["cy"], data["radius"], layer)
+        result = await backend.create_circle(data["cx"], data["cy"], data["radius"], layer, data.get("color"))
     elif operation == "create_polyline":
-        result = await backend.create_polyline(points or [], data.get("closed", False), layer)
+        result = await backend.create_polyline(points or [], data.get("closed", False), layer, data.get("color"))
     elif operation == "create_rectangle":
-        result = await backend.create_rectangle(x1, y1, x2, y2, layer)
+        result = await backend.create_rectangle(x1, y1, x2, y2, layer, data.get("color"))
     elif operation == "create_arc":
-        result = await backend.create_arc(data["cx"], data["cy"], data["radius"], data["start_angle"], data["end_angle"], layer)
+        result = await backend.create_arc(data["cx"], data["cy"], data["radius"], data["start_angle"], data["end_angle"], layer, data.get("color"))
     elif operation == "create_ellipse":
-        result = await backend.create_ellipse(data["cx"], data["cy"], data["major_x"], data["major_y"], data["ratio"], layer)
+        result = await backend.create_ellipse(data["cx"], data["cy"], data["major_x"], data["major_y"], data["ratio"], layer, data.get("color"))
     elif operation == "create_mtext":
-        result = await backend.create_mtext(data["x"], data["y"], data["width"], data["text"], data.get("height", 2.5), layer)
+        result = await backend.create_mtext(data["x"], data["y"], data["width"], data["text"], data.get("height", 2.5), layer, data.get("color"))
     elif operation == "create_hatch":
         result = await backend.create_hatch(entity_id, data.get("pattern", "ANSI31"))
     # --- Read ---
@@ -188,6 +196,18 @@ async def entity(
         result = await backend.entity_chamfer(data["id1"], data["id2"], data["dist1"], data["dist2"])
     elif operation == "erase":
         result = await backend.entity_erase(entity_id)
+    elif operation == "set_color":
+        result = await backend.entity_set_color(entity_id, data.get("color", "bylayer"))
+    elif operation == "delete_by":
+        result = await backend.entity_delete_by(
+            layer=data.get("layer"),
+            type=data.get("type"),
+            color=data.get("color"),
+            handles=data.get("handles"),
+            last_n=data.get("last_n"),
+        )
+    elif operation == "delete_all":
+        result = await backend.entity_delete_all(data.get("confirm", False))
     else:
         return _json({"error": f"Unknown entity operation: {operation}"})
 
@@ -325,7 +345,7 @@ async def annotation(
     """Annotation: text, dimensions, and leaders.
 
     Operations:
-      create_text             — data: {x, y, text, height?, rotation?, layer?}
+      create_text             — data: {x, y, text, height?, rotation?, layer?, color?}
       create_dimension_linear — data: {x1, y1, x2, y2, dim_x, dim_y}
       create_dimension_aligned — data: {x1, y1, x2, y2, offset}
       create_dimension_angular — data: {cx, cy, x1, y1, x2, y2}
@@ -338,7 +358,7 @@ async def annotation(
     if operation == "create_text":
         result = await backend.create_text(
             data["x"], data["y"], data["text"],
-            data.get("height", 2.5), data.get("rotation", 0.0), data.get("layer"),
+            data.get("height", 2.5), data.get("rotation", 0.0), data.get("layer"), data.get("color"),
         )
     elif operation == "create_dimension_linear":
         result = await backend.create_dimension_linear(
@@ -603,5 +623,5 @@ def main():
         ],
     )
 
-    log.info("autocad_mcp_starting", version="3.1.0")
+    log.info("autocad_mcp_starting", version="3.3.0")
     mcp.run(transport="stdio")
