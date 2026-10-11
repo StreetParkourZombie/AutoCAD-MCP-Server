@@ -1,6 +1,8 @@
 # Met Errors
 
-Errors encountered while integrating the AutoCAD MCP server on **AutoCAD MEP 2026 (Education)**, with root causes and fixes. Chronological.
+Errors encountered while integrating the AutoCAD MCP server on **AutoCAD MEP 2026 (Education)** and **AutoCAD LT**, with root causes and fixes. Chronological.
+
+§1–§14 were found by reasoning about the code. §15–§21 were found by driving the **live AutoCAD LT session** — they shipped with a fully green 213-test suite, because pytest reads `mcp_dispatch.lsp` as text and never calls it.
 
 ---
 
@@ -291,6 +293,147 @@ A second draft kept an `in_string` flag *and* skipped literals inline. The doubl
 
 ---
 
+## 15. `bad function: MCP-CMD-CREATE-LINE` — calling a function held in a variable
+
+**Symptom:** every colour-carrying create failed on the live backend. `create_line` without `color` worked; `create_line` with `color: "red"` raised `bad function: MCP-CMD-CREATE-LINE`. The command still executed — the colour was simply never applied.
+
+**Cause:** `mcp-create-with-color` received the handler as a symbol and invoked it as `(create-fn params)`. That is Common Lisp. AutoLISP parses the head of a call as a **symbol name only**, so it looked up a function literally called `create-fn`, found none, and said so.
+
+```lisp
+(setq result (apply create-fn (list params)))   ; fix
+```
+
+**Why pytest was green:** `test_create_commands_go_through_color_wrapper` asserted that each create branch *named* the wrapper. It never checked how the wrapper called the handler.
+
+**Regression guard:** `test_color_wrapper_invokes_handler_with_apply`.
+
+---
+
+## 16. Colour reported as applied, entity unchanged — bare `entmod` is a silent no-op
+
+**Symptom:** `set_color` returned `ok: true`, the response echoed the requested colour, and the drawing did not change. Reading the entity back showed group 62 still `nil`.
+
+**Cause:**
+
+```lisp
+(entmod (list (cons 62 aci)))   ; no error, no change
+```
+
+With no entity argument, `entmod` targets `entlast`; with a partial association list it replaces the entity's data with *only* what was passed. AutoCAD accepted the call, discarded nothing visibly, and the new entity simply had no colour.
+
+**Fix:** append onto the entity's existing DXF data:
+
+```lisp
+(defun mcp-set-color (ent aci)
+  (entmod (append (entget ent) (list (cons 62 aci)))))
+```
+
+The entity is passed explicitly rather than relying on `entlast` — recolouring a handle must not depend on that entity being the newest one in the drawing.
+
+**Verified live:** group 62 was `nil` with the bare form and `(62 . 3)` once `entget` was appended.
+
+**Regression guard:** `test_colour_write_appends_to_entget`, which also rejects `(entmod (list (cons 62` anywhere in the file.
+
+---
+
+## 17. `too many arguments` and `bad argument type: listp 3` — Common Lisp list idioms
+
+Two distinct faults in one helper (`mcp-take-last-n`, backing `delete_by(last_n=N)`), both written with Common Lisp muscle memory.
+
+| Written | Error | Why |
+|---------|-------|-----|
+| `(last lst n)` | `too many arguments` | AutoLISP `last` takes **one** argument and returns the final *cons cell* |
+| `(nth k lst)` | `bad argument type: listp 3` | AutoLISP `nth` returns the **element** at index `k`; Common Lisp's `nthcdr` returns the *tail* |
+
+The second is the more dangerous one. `(nth k lst)` returning the element at index 3 and that element being `3` produces an error message that points at the number rather than at the call.
+
+**Fix:** reverse, trim with a `car`/`cdr` walk, reverse back. Reversing puts the newest element first, so keeping the first `n` needs no index arithmetic at all:
+
+```lisp
+(setq rev (reverse lst))
+(setq kept '())
+(while (and rev (< (length kept) n))
+  (setq kept (append kept (list (car rev))))
+  (setq rev (cdr rev))
+)
+(reverse kept)
+```
+
+**Regression guards:** `test_no_common_lisp_last_with_count`, `test_take_last_n_avoids_nth_as_tail`.
+
+---
+
+## 18. `matched: 0` against a layer that visibly had entities — AutoLISP treats `0` as true
+
+**Symptom:** `delete_by(layer="MCPTEST")` returned `{"matched": 0, "deleted": 0}` with entities demonstrably present on that layer. No error, no timeout.
+
+**Cause:** an absent `last_n` arrives as an empty string, and `(atoi "")` is `0`. In AutoLISP **only `nil` is false** — `0` is true. So the "no limit given" branch did not fire; instead a limit of zero was applied, and the match list was trimmed to nothing before the delete loop ever ran.
+
+```lisp
+;; before — 0 passes the test, then empties the list
+(if last-n-str (mcp-take-last-n targets (atoi last-n-str)) targets)
+
+;; after
+(if (and last-n-str (> (atoi last-n-str) 0))
+  (mcp-take-last-n targets (atoi last-n-str))
+  targets)
+```
+
+This is the generalisable rule: **any numeric guard in AutoLISP must compare explicitly.** `(if n ...)` is not "if n is non-zero"; it is "if n is not nil".
+
+**Regression guard:** `test_last_n_requires_a_positive_count`.
+
+---
+
+## 19. An empty JSON string decoded as `"` — truthy, so every filter rejected everything
+
+**Symptom:** the same `matched: 0` response, from a different cause. `delete_by(color="cyan")` found nothing even with a cyan entity on screen — while `delete_by` was refusing nothing and erroring about nothing.
+
+**Cause:** the scan in `mcp-json-get-string` carried an `(or (= end-pos pos))` clause that advanced one position past the closing quote. For an empty value `""`, `end-pos == pos` and the result was the single character `"`, not `nil`.
+
+Every presence check in the delete path is `(if handles-str ...)`, and a lone quote is truthy. The filter therefore compared against a `("")` handle list and matched nothing:
+
+```lisp
+;; before — forces the scan one step past the closing quote
+(if (or (= end-pos pos)) (substr json pos 1) (substr json pos (- end-pos pos)))
+
+;; after
+(if (= end-pos pos) nil (substr json pos (- end-pos pos)))
+```
+
+Related: `(mcp-split-string "" ";")` returns `("")`, never `nil` — it always appends the trailing remainder. A `(strlen handles-str) > 1` guard was added before the split.
+
+**Regression guard:** `test_empty_json_string_decodes_to_nil`.
+
+---
+
+## 20. Six broken AutoLISP forms, 213 passing tests
+
+**Symptom:** the whole suite was green while five of six colour/delete paths were non-functional in AutoCAD.
+
+**Cause:** `mcp_dispatch.lsp` is plain text. `tests/test_lisp_dispatcher.py` reads it with a string-aware scanner and asserts *structure* — paren balance, unique defun names, a handler behind every `cond` branch, colour-table agreement. None of that executes a single form.
+
+Structure is necessary and not sufficient. §15 was a missing `apply`; §16 was an `entmod` that returns successfully while doing nothing; §17 was two functions called with Common Lisp arities; §18 and §19 were guards defeated by truthiness. All five are invisible to a parser.
+
+**Fix:** each defect now has a named structural test *and* the live-verification record below. The tests catch regressions; only AutoCAD catches semantics.
+
+> [!IMPORTANT]
+> A green `pytest` run is evidence that the dispatcher is **well-formed**. It is not evidence that any of it **works**. After a LISP change, reload and exercise the path against a throwaway layer.
+
+---
+
+## 21. Two live test scripts at once — fabricated failures
+
+**Symptom:** a live run reported `bylayer -> ACI 256` and `delete_by(color) succeeded` as FAILURES. Both had just passed individually.
+
+**Cause:** both scripts shared `C:/temp`. Each writes `autocad_mcp_cmd_{id}.json`, and one trigger of `c:mcp-dispatch` consumes **the first command file only** — so each script consumed the other's payload. Symptoms: `Timeout waiting for result (request_id=...)` interleaved across scripts, mismatched `request_id`s, and results attributed to the wrong caller.
+
+**Fix:** run live tests strictly one at a time. The directory has no per-process isolation; concurrency is not supported.
+
+**Also:** dispatcher autoload is flaky — `initialize()` occasionally logs `dispatcher_missing_trying_autoload`. Reloading the LISP explicitly first clears it.
+
+---
+
 ## Quick Diagnostic Sequence
 
 When input/IPC fails:
@@ -317,8 +460,17 @@ When verifying a **destructive operation** against a live drawing:
 12. Erase by **handle**, created in the same step. `ERASE _ALL` is not on the denylist — nothing stops a careless test from reaching for it (see [System_Context §7b](System_Context.md)).
 13. Treat an empty selector set as a bug in the *caller*, not a no-op. `delete_by` refuses it; `delete_all` refuses without `confirm: true`.
 
+When **pytest is green but the behaviour is wrong in AutoCAD**:
+
+14. Pytest parsed the LISP; AutoCAD never ran it. Read the failing path against the AutoLISP semantic traps: only `nil` is false, `last` is unary, `nth` returns an element not a tail, a function in a variable needs `apply`, a bare `entmod` list is a no-op (§15–§18).
+15. A `"` or `""` in place of `nil` defeats every `if <value>` guard downstream. Suspect the parser before the filter (§19).
+16. Run live tests **one at a time**. Two scripts sharing `C:/temp` consume each other's command files and produce failures that are artefacts, not defects (§21).
+
 > [!NOTE]
 > Every passthrough bug in §8–§14 returned `ok: true` or a well-formed value. The Text Window was empty. Only a probe that printed what a function **returns** — or a manual reproduction of a checker's claim — revealed the fault. Reading the source repeatedly did not.
+
+> [!NOTE]
+> §15–§21 failed the same way §8–§14 did: `ok: true`, or an AutoLISP error buried inside a payload, and never a test failure. They shipped green for a plainer reason — no test executed the LISP at all. Structural checks and live execution answer different questions; a change to `mcp_dispatch.lsp` needs both.
 
 > [!CAUTION]
 > v3.3 adds batch delete. Before running any of it against a real drawing: reload `mcp_dispatch.lsp` (§9), then test on a throwaway `TEMP` layer, never on `0`.

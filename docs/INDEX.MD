@@ -7,7 +7,7 @@ AutoCAD MCP Server — documentation map.
 | Document | Contents |
 |----------|----------|
 | [INDEX.MD](INDEX.MD) | This file — documentation map |
-| [Met_Errors.md](Met_Errors.md) | Errors encountered during integration and their root causes/fixes |
+| [Met_Errors.md](Met_Errors.md) | Errors encountered during integration and their root causes/fixes. §1–§14 found by reading code; §15–§21 found by driving live AutoCAD |
 | [System_Context.md](System_Context.md) | Runtime context: windows, desktops, IPC protocol state, colour/BYLAYER semantics, destructive-operation surface |
 | [../README.md](../README.md) | Installation, configuration, tool reference, entity colour and batch delete usage |
 
@@ -23,7 +23,10 @@ AutoCAD MCP Server — documentation map.
 - **M8ven Trust Index** — the repo is listed and Live Monitored (re-scored on every push). Badge is in the README; the scan checks tool hints and per-tool test coverage, both now at 8/8.
 
 ### Known Error Classes
-See [Met_Errors.md](Met_Errors.md) for full detail:
+See [Met_Errors.md](Met_Errors.md) for full detail. **§1–§14** were found by reading the code; **§15–§21** were found by driving live AutoCAD, and shipped with a fully green 213-test suite.
+
+**Found by reading the code:**
+
 1. **Stale/wrong window handle** — finder picking Help/Text Window; `IsWindow` returning False across desktops.
 2. **Click obstruction** — Help window overlaying the WPF CLI Palette, stealing injected clicks.
 3. **Unparseable LISP result** — Vietnamese layer names (`\U+XXXX` escapes + cp1252) breaking `json.loads`, surfacing as bogus IPC timeouts.
@@ -33,6 +36,14 @@ See [Met_Errors.md](Met_Errors.md) for full detail:
 7. **JSON coercion on passthrough tokens** — a numeric token (`"1"` as radius) arrives as Python `int` through the schema; `int` has no `.replace` (§10).
 8. **`entget` after `entdel` returns nil** — batch delete read each handle *after* erasing the entity, so `handles` came back empty in every successful response (§13).
 9. **Comment-stripping misreads `;` as a comment** — a naive paren counter treated `";"` (the real delimiter passed to `mcp-split-string`) as a comment marker and deleted real closing parentheses, reporting a phantom imbalance of 13 in a file with none (§14).
+
+**Found by live AutoCAD testing — none of these fail a test:**
+
+10. **Common Lisp leaking into AutoLISP** — calling a function held in a variable requires `apply`, not `(fn params)` (§15); `(last lst n)` raises `too many arguments` because `last` is unary; `(nth k lst)` returns the *element*, not the *tail* (§17).
+11. **Bare `entmod` is a silent no-op** — `(entmod (list (cons 62 aci)))` returns success and changes nothing. Colour must be appended onto `(entget ent)` (§16).
+12. **AutoLISP truthiness** — only `nil` is false, so `(atoi "")` = `0` passes an `if` test and then trims the match list to empty; `delete_by` reports `matched: 0` against a layer full of entities (§18).
+13. **An empty JSON string decoding as `"`** — a stray quote is truthy, so every `(if <field>)` guard downstream passed and the handle filter rejected the whole drawing (§19).
+14. **Parallel live tests fabricating failures** — two scripts sharing `C:/temp` consume each other's command files. Run live tests one at a time (§21).
 
 > **Diagnostic rule:** these do not appear in the AutoCAD Text Window and do not time out. To find them, probe one expression at a time and print what it **returns** — a predicate reading correctly in the source can still return `nil`. The same rule applies to static analysis: a checker that reports a problem is making claims about the code, so verify the checker before rewriting the code.
 
@@ -46,10 +57,10 @@ See [Met_Errors.md](Met_Errors.md) for full detail:
 
 ### Dispatcher Test Coverage
 
-`mcp_dispatch.lsp` is plain text loaded at runtime — nothing in pytest exercises it, so a paren typo surfaced as an opaque `dispatcher not loaded` error minutes later (§9). `tests/test_lisp_dispatcher.py` now walks the source with a string-aware scanner and asserts paren balance, unique defun names, a handler behind every `cond` branch, and agreement between the LISP colour map and `_color_to_int`.
+`mcp_dispatch.lsp` is plain text loaded at runtime — nothing in pytest executes it, so a paren typo surfaced as an opaque `dispatcher not loaded` error minutes later (§9). `tests/test_lisp_dispatcher.py` now walks the source with a string-aware scanner and asserts paren balance, unique defun names, a handler behind every `cond` branch, agreement between the LISP colour map and `_color_to_int`, and the specific AutoLISP shapes behind §15–§19 (an `apply` call, an `entget` append, no two-argument `last`, no `nth` used as a tail, a `> 0` guard, an empty-string branch returning `nil`).
 
 > [!NOTE]
-> Pytest can prove the dispatcher is **well-formed**. It cannot prove AutoCAD has it **loaded**. After any LISP edit, reload before trusting a failure mode.
+> Pytest can prove the dispatcher is **well-formed**. It cannot prove AutoCAD has it **loaded**, nor that it behaves correctly once loaded — the suite was green while five of six colour/delete paths were broken. After any LISP edit, reload and exercise the path against a throwaway layer. See [System_Context §11](System_Context.md).
 
 ### Runtime Context
 See [System_Context.md](System_Context.md):

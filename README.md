@@ -328,12 +328,28 @@ All desktop-sensitive calls (`EnumWindows`, `IsWindow`, `SetCursorPos`, `SendInp
 
 Ground truth for "did AutoCAD get it?": press **F2** and read the Text Window (command echo + LISP errors).
 
+The hardest failures are the ones that appear in **neither** place — the operation returns `ok: true` and simply does the wrong thing:
+
+| Symptom | Likely cause | See |
+|---------|--------------|-----|
+| `set_color` returns `ok` but the colour never changes | `(entmod (list (cons 62 …)))` is a silent no-op — the list must be appended to `(entget ent)` | [Met_Errors §16](docs/Met_Errors.md) |
+| `create_line` with a colour fails, without one succeeds | `(fn params)` is Common Lisp; AutoLISP needs `apply` | [Met_Errors §15](docs/Met_Errors.md) |
+| `delete_by` reports `matched: 0` on a populated layer | AutoLISP treats only `nil` as false — `0` is true; or `""` decoded to a truthy `"` | [Met_Errors §18](docs/Met_Errors.md), [§19](docs/Met_Errors.md) |
+| `delete_by(last_n=…)` raises `too many arguments` / `bad argument type: listp 3` | `last` is unary and `nth` returns an element, not a tail | [Met_Errors §17](docs/Met_Errors.md) |
+| `handles` is empty on a successful delete | handle captured after `entdel`, when `entget` already returns `nil` | [Met_Errors §13](docs/Met_Errors.md) |
+| Two live test runs report failures individually-passing tests | both share `C:/temp` and consume each other's command files — run them one at a time | [Met_Errors §21](docs/Met_Errors.md) |
+
 ## Development
 
 ```powershell
 uv sync
 uv run pytest tests/ -v
 ```
+
+> [!IMPORTANT]
+> `mcp_dispatch.lsp` is plain text that AutoCAD loads at runtime — **pytest never executes it**. The suite asserts *structure* (paren balance, unique defuns, a handler per `cond` branch, colour-table agreement). A green run proves the dispatcher is well-formed, not that it works: six AutoLISP defects shipped with 213 passing tests and were only found by driving a live AutoCAD.
+>
+> After editing the LISP, reload it and exercise the affected path against a throwaway layer. See [docs/Met_Errors.md §15–§21](docs/Met_Errors.md) for the AutoLISP traps — `last` is unary, `nth` returns an element, `0` is true, an indirect call needs `apply`, and a bare `entmod` list does nothing.
 
 ## AutoCAD LT AutoLISP Compatibility
 
@@ -353,7 +369,8 @@ The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
 - **Entity colour** - Every `entity` create operation takes an optional `color`, `set_color` recolours an existing entity, and `list` / `get` now report each entity's ACI colour. Accepts names (`red`, `cyan`, ...), ACI indices, and `bylayer` / `byblock`. Setting an explicit colour breaks the entity's inherit-from-layer behaviour; `bylayer` restores it.
 - **Batch delete** - `delete_by` removes every entity matching any combination of `layer`, `type`, `color`, `handles`, or `last_n` (ANDed; at least one required). `delete_all` wipes the drawing behind a `confirm: true` guard. Both report `matched` and `deleted` separately so a partial delete is visible.
-- **Dispatcher syntax tests** - `tests/test_lisp_dispatcher.py` walks the AutoLISP source with a string-aware scanner and asserts parenthesis balance, unique defun names, and that every `cond` branch has a handler. The dispatcher is plain text loaded at runtime, so a paren typo otherwise surfaces as an opaque dispatcher-not-loaded error minutes later.
+- **Dispatcher syntax tests** - `tests/test_lisp_dispatcher.py` walks the AutoLISP source with a string-aware scanner and asserts parenthesis balance, unique defun names, that every `cond` branch has a handler, and the exact AutoLISP shapes behind six defects found by live testing (indirect call via `apply`, colour appended to `entget`, no two-argument `last`, no `nth` used as a tail, an explicit `> 0` guard, empty strings decoding to `nil`).
+- **Live-verified colour and batch delete** - both paths were exercised against a running AutoCAD LT on a throwaway `MCPTEST` layer: coloured create, `set_color` to cyan and back to `bylayer`, `delete_by(color=…)`, and both refusal guards. Six AutoLISP bugs surfaced in the process — a missing `apply`, a bare `entmod` that returned success while changing nothing, two Common Lisp list idioms, and two truthiness traps. See [Met_Errors §15–§21](docs/Met_Errors.md).
 
 ## What's New in v3.2
 

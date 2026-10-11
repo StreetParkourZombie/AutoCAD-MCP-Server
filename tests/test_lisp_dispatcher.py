@@ -70,6 +70,38 @@ def scan(src: str) -> tuple[int, int]:
     return depth, unterminated
 
 
+def code_only(src: str) -> str:
+    """Return src with string literals and comments blanked out, preserving offsets.
+
+    Several tests assert that a forbidden AutoLISP idiom is absent. The
+    dispatcher explains each of those idioms in its docstrings and comments,
+    so searching raw text always matched the prose describing the bug
+    rather than the bug. Reusing the same string-aware walk as scan keeps
+    every index identical, so the returned text stays line-aligned.
+    """
+    out = list(src)
+    i = 0
+    while i < len(src):
+        ch = src[i]
+        if ch == '"':
+            end = _skip_literal(src, i)
+            for j in range(i, min(end, len(out))):
+                if out[j] != "\n":
+                    out[j] = " "
+            i = end
+            continue
+        if ch == ";":
+            nl = src.find("\n", i)
+            end = len(src) if nl == -1 else nl
+            for j in range(i, end):
+                if out[j] != "\n":
+                    out[j] = " "
+            i = end
+            continue
+        i += 1
+    return "".join(out)
+
+
 def top_level_defuns(src: str) -> list[str]:
     """Names of every top-level defun whose form closes cleanly.
 
@@ -165,6 +197,103 @@ class TestDispatcherCoverage:
         wrapped = set(re.findall(r"mcp-create-with-color 'mcp-cmd-create-([a-z-]+)", source))
         expected = {"line", "circle", "polyline", "rectangle", "text", "arc", "ellipse", "mtext"}
         assert expected <= wrapped, f"creates not routed through the colour wrapper: {expected - wrapped}"
+
+    def test_color_wrapper_invokes_handler_with_apply(self, source):
+        """AutoLISP cannot call a function held in a variable directly.
+
+        ``(create-fn params)`` is Common Lisp. AutoLISP parses the head of a
+        call as a symbol name only, so this raised
+        ``bad function: MCP-CMD-CREATE-LINE`` on the live backend and broke
+        every colour-carrying create while the whole suite stayed green —
+        pytest reads the LISP as text and never calls it. ``apply`` is the
+        AutoLISP equivalent and is the only form that works here.
+        """
+        body = re.search(r"\(defun mcp-create-with-color.*?\n\)", source, re.S)
+        assert body, "mcp-create-with-color not found"
+        text = body.group(0)
+        assert "(apply create-fn (list params))" in text, (
+            "handler is not invoked via apply — AutoLISP will raise "
+            "'bad function' at runtime"
+        )
+        # Ignore the defun header, which legitimately names the parameter.
+        body_only = text.split(")", 1)[1] if ")" in text else text
+        assert not re.search(r"\(\s*create-fn\s+", code_only(body_only)), (
+            "(create-fn params) is Common Lisp syntax; AutoLISP cannot "
+            "evaluate a variable in the head of a call"
+        )
+
+    def test_no_common_lisp_last_with_count(self, source):
+        """AutoLISP `last` takes one argument; (last lst n) is a runtime error.
+
+        Found by live testing: every delete_by call failed with
+        \"too many arguments\" because of this one form.
+        """
+        bad = re.findall(r"\(last\s+[^\s()]+[^\s()]*\s+[^\s()]*\s*\)", code_only(source))
+        assert not bad, (
+            f"two-argument `last` is Common Lisp, not AutoLISP: {bad}"
+        )
+
+    def test_take_last_n_avoids_nth_as_tail(self, source):
+        """AutoLISP `nth` returns the element, not the sublist at that index.
+
+        Using it to reach a tail the way Common Lisp's nthcdr does yields a
+        number where a list is expected — \"bad argument type: listp 3\".
+        """
+        body = re.search(r"\(defun mcp-take-last-n.*?\n\)", source, re.S)
+        assert body, "mcp-take-last-n not found"
+        text = body.group(0)
+        assert "(last " not in code_only(text).replace("(last head)", ""), (
+            "mcp-take-last-n must not call `last` on an element from nth"
+        )
+
+    def test_colour_write_appends_to_entget(self, source):
+        """A bare (entmod (list (cons 62 aci))) silently does nothing.
+
+        It returns without error but leaves group 62 nil, so the caller is
+        told the colour was applied when it never was. Confirmed against
+        live AutoCAD: g62 stayed nil with the bare form and became (62 . 3)
+        once entget was appended.
+        """
+        body = re.search(r"\(defun mcp-set-color.*?\n\)", source, re.S)
+        assert body, "mcp-set-color not found"
+        assert "(append (entget ent)" in body.group(0), (
+            "colour must be appended onto the entity's existing DXF data"
+        )
+        assert "(entmod (list (cons 62" not in code_only(source), (
+            "bare entmod on a colour list is a silent no-op in AutoCAD"
+        )
+
+    def test_empty_json_string_decodes_to_nil(self, source):
+        """An empty JSON value must not decode to a stray quote.
+
+        Live probe returned handles_str as '\"' rather than '' for "". A lone
+        quote is truthy in AutoLISP, so every 'is this field set?' guard was
+        defeated and delete_by's handle filter rejected the whole drawing.
+        """
+        body = re.search(r"\(defun mcp-json-get-string.*?\n  \)", source, re.S)
+        assert body, "mcp-json-get-string not found"
+        text = body.group(0)
+        assert "(if (= end-pos pos)" in text, (
+            "empty string values must return nil, not a zero-length slice"
+        )
+        assert "(or (= end-pos pos)" not in text, (
+            "the (= end-pos pos) clause forces the scan one step past the "
+            "closing quote, which is what produced the stray quote"
+        )
+
+    def test_last_n_requires_a_positive_count(self, source):
+        """AutoLISP treats only nil as false, so 0 is truthy.
+
+        An absent last_n arrives as an empty string and (atoi "") is 0. That
+        zero passed the selector test and then trimmed the match list to
+        nothing, so delete_by reported matched=0 against a layer that
+        definitely had entities on it.
+        """
+        body = re.search(r"\(defun mcp-cmd-entity-delete-by.*?\n\)", source, re.S)
+        assert body, "mcp-cmd-entity-delete-by not found"
+        assert "(> (atoi last-n-str) 0)" in body.group(0), (
+            "last_n must require a positive count — AutoLISP treats 0 as true"
+        )
 
     @pytest.mark.parametrize("cmd", ["entity-set-color", "entity-delete-by", "entity-delete-all"])
     def test_new_commands_registered(self, source, cmd):

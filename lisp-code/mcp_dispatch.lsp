@@ -98,18 +98,23 @@
           (if (null pos) nil
             (progn
               (setq pos (+ pos 2))  ; 0-based search result + 2 = 1-based position after quote
-              ;; Find closing quote (skip escaped quotes)
+              ;; Find the closing quote (skip escaped quotes)
               (setq end-pos pos)
-              (while (and (<= end-pos (strlen json))
-                          (or (= end-pos pos)
-                              (/= (substr json end-pos 1) "\"")))
+              (while (and (< end-pos (strlen json))
+                          (/= (substr json end-pos 1) "\""))
                 ;; Handle escaped characters
                 (if (= (substr json end-pos 1) "\\")
                   (setq end-pos (+ end-pos 2))
                   (setq end-pos (1+ end-pos))
                 )
               )
-              (substr json pos (- end-pos pos))
+              ;; end-pos == pos means the value was empty, e.g. "". Return nil
+              ;; for it so callers' presence checks work — a stray quote
+              ;; character would be truthy and silently defeat them.
+              (if (= end-pos pos)
+                nil
+                (substr json pos (- end-pos pos))
+              )
             )
           )
         )
@@ -191,6 +196,45 @@
   )
 )
 
+(defun mcp-take-last-n (lst n / count rev kept)
+  "Return the newest n elements of lst, preserving their original order.
+
+  Two AutoLISP differences make the obvious spellings fail:
+    - `last` takes one argument, so the Common Lisp (last lst n) form
+      raises \"too many arguments\".
+    - `nth` returns the element at an index, not the sublist starting
+      there, so it cannot express \"drop the first k\" the way Common
+      Lisp's nthcdr does.
+  Reversing instead puts the newest element first, so trimming to the
+  first n is a simple car/cdr walk, and reversing back restores the
+  original order. Clamps n and returns nil for an empty list."
+  (if (or (null lst) (< n 1))
+    nil
+    (progn
+      (setq count (length lst))
+      (if (> n count) (setq n count))
+      (setq rev (reverse lst))
+      (setq kept '())
+      (while (and rev (< (length kept) n))
+        (setq kept (append kept (list (car rev))))
+        (setq rev (cdr rev))
+      )
+      (reverse kept)
+    )
+  )
+)
+
+(defun mcp-set-color (ent aci)
+  "Write an ACI colour onto a specific entity.
+
+  The list must be appended to the entity's existing DXF data: the bare
+  (entmod (list (cons 62 aci))) form returns without error but leaves
+  group 62 nil, so the colour silently never lands. This one-argument
+  entmod targets entlast, which is why the entity is passed explicitly —
+  recolouring an arbitrary handle must not depend on it being newest."
+  (entmod (append (entget ent) (list (cons 62 aci))))
+)
+
 (defun mcp-apply-color (params / color aci)
   "Set an explicit colour on the entity just created, if one was requested.
 
@@ -200,7 +244,7 @@
   (if color
     (progn
       (setq aci (mcp-color-to-aci color))
-      (entmod (list (cons 62 aci)))
+      (mcp-set-color (entlast) aci)
     )
   )
 )
@@ -210,8 +254,12 @@
 
   Colour has to be applied after the (command ...) call — the entity must
   exist before entmod can touch it. Wrapping here keeps that ordering in
-  one place instead of in every create defun."
-  (setq result (create-fn params))
+  one place instead of in every create defun.
+
+  create-fn arrives as the symbol name, so it must be invoked with apply:
+  AutoLISP has no (create-fn params) form — that is Common Lisp — and
+  calling it that way raises \"bad function: MCP-CMD-CREATE-LINE\"."
+  (setq result (apply create-fn (list params)))
   (if (mcp-json-get-string params "color")
     (mcp-apply-color params)
   )
@@ -1058,7 +1106,7 @@ wrapping it in a handler, hence the validation up front."
       (if (not ent)
         (cons nil (strcat "Entity not found: " entity-id))
         (progn
-          (entmod (list (cons 62 aci)))
+          (mcp-set-color ent aci)
           (cons T (strcat "{\"handle\":\"" (cdr (assoc 5 (entget ent))) "\",\"color\":" (itoa aci) "}"))
         )
       )
@@ -1069,15 +1117,21 @@ wrapping it in a handler, hence the validation up front."
 (defun mcp-cmd-entity-delete-by
   (params / layer etype color handles-str last-n-str last-n handles aci
           ent ent-data ent-layer ent-type ent-color targets
-          matched deleted handles-out target h)
+          matched deleted handles-out target h n)
   (setq layer (mcp-json-get-string params "layer"))
   (setq etype (mcp-json-get-string params "type"))
   (setq color (mcp-json-get-string params "color"))
   (setq handles-str (mcp-json-get-string params "handles_str"))
   (setq last-n-str (mcp-json-get-string params "last_n_str"))
-  (setq last-n (if (and last-n-str (> (strlen last-n-str) 0)) (atoi last-n-str) nil))
+  ;; An empty last_n_str parses to 0, and AutoLISP treats only nil as false,
+  ;; so 0 would pass as a real selector and then mcp-take-last-n would drop
+  ;; every match. Require a positive count.
+  (setq last-n (if (and last-n-str (> (atoi last-n-str) 0)) (atoi last-n-str) nil))
+  ;; Only split a genuinely non-empty handle list. mcp-split-string of ""
+  ;; yields the list (""), which is truthy, and the (member ...) test below
+  ;; would then reject every entity in the drawing.
   (setq handles
-    (if (and handles-str (> (strlen handles-str) 0))
+    (if (and handles-str (> (strlen handles-str) 1))
       (mcp-split-string handles-str ";")
       nil
     )
@@ -1104,7 +1158,10 @@ wrapping it in a handler, hence the validation up front."
         )
         (setq ent (entnext ent))
       )
-      (if last-n (setq targets (reverse (last (reverse targets) last-n))))
+      ;; Keep only the newest N matches.
+      (if last-n
+        (setq targets (mcp-take-last-n targets last-n))
+      )
 
       (setq matched (length targets))
       (setq deleted 0)
